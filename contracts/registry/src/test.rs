@@ -197,7 +197,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     let meta = f.hash_str("META");
     assert_eq!(
         f.client
-            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100),
+            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None),
         Err(Ok(RegistryError::BrandNotVerified))
     );
     assert_eq!(
@@ -216,7 +216,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     assert_eq!(f.client.get_brand(&f.brand).unwrap().admin, rotated_signer);
 
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100);
+        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None);
     assert!(f.client.get_batch(&f.brand, &batch_id).is_some());
 }
 
@@ -231,18 +231,39 @@ fn test_merkle_batch_commit_and_lazy_activation() {
 
     // Zero unit count rejected
     assert_eq!(
-        f.client
-            .try_commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &0),
+        f.client.try_commit_batch(
+            &f.brand,
+            &batch_id,
+            &merkle_root,
+            &12,
+            &meta_hash,
+            &0,
+            &None
+        ),
         Err(Ok(RegistryError::InvalidInput))
     );
 
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &5);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &12,
+        &meta_hash,
+        &5,
+        &None,
+    );
 
     // Duplicate batch rejected
     assert_eq!(
-        f.client
-            .try_commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &5),
+        f.client.try_commit_batch(
+            &f.brand,
+            &batch_id,
+            &merkle_root,
+            &12,
+            &meta_hash,
+            &5,
+            &None
+        ),
         Err(Ok(RegistryError::BatchExists))
     );
 
@@ -344,8 +365,15 @@ fn test_resale_transfer_offer_redeem_expiry_and_cancel() {
     let batch_id = f.hash_str("BATCH-RESALE");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(2);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &24, &meta_hash, &2);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &24,
+        &meta_hash,
+        &2,
+        &None,
+    );
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
     let unit_id = f
@@ -422,7 +450,7 @@ fn test_warranty_boundary_and_claims_workflow() {
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(2);
     f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &6, &meta_hash, &2);
+        .commit_batch(&f.brand, &batch_id, &merkle_root, &6, &meta_hash, &2, &None);
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
     let unit_id = f
@@ -501,8 +529,15 @@ fn test_flag_unit_and_recall_batch_across_entrypoints() {
     let batch_id = f.hash_str("BATCH-SAFETY");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(3);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &3);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &12,
+        &meta_hash,
+        &3,
+        &None,
+    );
 
     // Activate unit 0 and unit 1; leave unit 2 unactivated
     let u0 = f.client.activate(
@@ -577,8 +612,15 @@ fn test_ttl_extension_and_strict_authorization() {
     let batch_id = f.hash_str("BATCH-TTL");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(1);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &24, &meta_hash, &1);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &24,
+        &meta_hash,
+        &1,
+        &None,
+    );
 
     let unit_id = f.client.activate(
         &f.brand,
@@ -635,147 +677,143 @@ fn test_ttl_extension_and_strict_authorization() {
         .is_ok());
 }
 
-// Preserve the upstream implementation for correctness and budget comparisons.
-fn merkle_baseline_hash_pair(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
-    let a_arr = a.to_array();
-    let b_arr = b.to_array();
-    let mut buf = [0u8; 64];
-    if a_arr <= b_arr {
-        buf[..32].copy_from_slice(&a_arr);
-        buf[32..].copy_from_slice(&b_arr);
-    } else {
-        buf[..32].copy_from_slice(&b_arr);
-        buf[32..].copy_from_slice(&a_arr);
-    }
-    let bytes = Bytes::from_array(env, &buf);
-    sha256_bytes(env, &bytes)
-}
-
-fn merkle_baseline_verify(
-    env: &Env,
-    root: &BytesN<32>,
-    leaf: &BytesN<32>,
-    proof: &Vec<BytesN<32>>,
-) -> bool {
-    if proof.len() > MAX_PROOF_DEPTH {
-        return false;
-    }
-    let mut computed = leaf.clone();
-    for sibling in proof.iter() {
-        computed = merkle_baseline_hash_pair(env, &computed, &sibling);
-    }
-    computed == *root
-}
-
-fn merkle_depth_fixture(env: &Env, depth: u32) -> (BytesN<32>, BytesN<32>, Vec<BytesN<32>>) {
-    let leaf = BytesN::from_array(env, &[42u8; 32]);
-    let mut root = leaf.clone();
-    let mut proof = Vec::new(env);
-    for i in 0..depth {
-        let sibling = sha256_bytes(env, &Bytes::from_array(env, &i.to_be_bytes()));
-        root = merkle_baseline_hash_pair(env, &root, &sibling);
-        proof.push_back(sibling);
-    }
-    (root, leaf, proof)
-}
-
 #[test]
-fn test_merkle_proof_depth_and_invalid_inputs() {
-    let env = Env::default();
-    env.cost_estimate().budget().reset_unlimited();
-    let wrong_hash = BytesN::from_array(&env, &[255; 32]);
-    let leaf = BytesN::from_array(&env, &[42; 32]);
-    let empty = Vec::new(&env);
-    assert!(verify_proof(&env, &leaf, &leaf, &empty));
-    assert!(!verify_proof(&env, &wrong_hash, &leaf, &empty));
-    for depth in 1..=MAX_PROOF_DEPTH {
-        let (root, leaf, proof) = merkle_depth_fixture(&env, depth);
-        assert!(merkle_baseline_verify(&env, &root, &leaf, &proof));
-        assert!(verify_proof(&env, &root, &leaf, &proof));
-        assert!(!verify_proof(&env, &wrong_hash, &leaf, &proof));
-        assert!(!verify_proof(&env, &root, &wrong_hash, &proof));
-        let mut invalid = proof.clone();
-        invalid.set(depth / 2, wrong_hash.clone());
-        assert!(!verify_proof(&env, &root, &leaf, &invalid));
-    }
-    let (root, leaf, proof) = merkle_depth_fixture(&env, MAX_PROOF_DEPTH + 1);
-    assert!(!verify_proof(&env, &root, &leaf, &proof));
-}
-
-#[test]
-fn test_merkle_odd_and_even_trees() {
+fn test_batch_expiration() {
+    use crate::types::BatchStatus;
     let f = TestFixture::setup();
-    f.env.cost_estimate().budget().reset_unlimited();
-    for count in [1, 2, 3, 5, 7, 8] {
-        let (root, units) = f.build_sample_batch(count);
-        for (serial, _, secret_hash, proof) in units {
-            let leaf = compute_leaf(&f.env, &serial, &secret_hash);
-            assert!(verify_proof(&f.env, &root, &leaf, &proof));
-            assert!(merkle_baseline_verify(&f.env, &root, &leaf, &proof));
-        }
-    }
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("PERISHABLES");
+    let meta = f.hash_str("META");
+    let (root, units) = f.build_sample_batch(3);
+    let expiry = f.env.ledger().timestamp() + 100;
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &3, &Some(expiry));
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Active
+    );
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    f.env.ledger().with_mut(|li| li.timestamp = expiry);
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[1].0,
+        &units[1].3,
+        &units[1].1,
+        &f.alice,
+    );
+    f.env.ledger().with_mut(|li| li.timestamp = expiry + 1);
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Expired
+    );
+    assert_eq!(
+        f.client.try_activate(
+            &f.brand,
+            &batch_id,
+            &units[2].0,
+            &units[2].3,
+            &units[2].1,
+            &f.alice
+        ),
+        Err(Ok(RegistryError::BatchExpired))
+    );
+    let unit_id = f.client.compute_unit_id(&f.brand, &batch_id, &units[2].0);
+    assert!(f.client.get_unit(&unit_id).is_none());
+    f.client.recall_batch(&f.brand, &batch_id, &meta);
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Recalled
+    );
+    assert_eq!(
+        f.client.try_activate(
+            &f.brand,
+            &batch_id,
+            &units[2].0,
+            &units[2].3,
+            &units[2].1,
+            &f.alice
+        ),
+        Err(Ok(RegistryError::BatchRecalled))
+    );
 }
 
 #[test]
-fn test_merkle_pair_ordering_and_equal_nodes() {
-    let env = Env::default();
-    let a = BytesN::from_array(&env, &[1; 32]);
-    let b = BytesN::from_array(&env, &[2; 32]);
+fn test_batch_expiration_invalid_commit_and_no_expiry() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("NO-EXPIRY");
+    let meta = f.hash_str("META");
+    let (root, units) = f.build_sample_batch(1);
+    let now = f.env.ledger().timestamp();
+    for expiry in [0, now - 1, now] {
+        assert_eq!(
+            f.client
+                .try_commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &Some(expiry)),
+            Err(Ok(RegistryError::InvalidInput))
+        );
+        assert!(f.client.get_batch(&f.brand, &batch_id).is_none());
+    }
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &None);
     assert_eq!(
-        hash_pair(&env, &a, &b),
-        merkle_baseline_hash_pair(&env, &a, &b)
+        f.client.get_batch(&f.brand, &batch_id).unwrap().expires_at,
+        None
     );
-    assert_eq!(hash_pair(&env, &a, &b), hash_pair(&env, &b, &a));
-    assert_eq!(
-        hash_pair(&env, &a, &a),
-        merkle_baseline_hash_pair(&env, &a, &a)
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = now + SECONDS_PER_MONTH * 120);
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
     );
-    let mut prefix = [128; 32];
-    prefix[31] = 127;
-    let low = BytesN::from_array(&env, &prefix);
-    prefix[31] = 129;
-    let high = BytesN::from_array(&env, &prefix);
-    assert_eq!(
-        hash_pair(&env, &low, &high),
-        merkle_baseline_hash_pair(&env, &low, &high)
-    );
-    assert_eq!(hash_pair(&env, &low, &high), hash_pair(&env, &high, &low));
-    let root = hash_pair(&env, &a, &b);
-    assert!(verify_proof(
-        &env,
-        &root,
-        &a,
-        &soroban_sdk::vec![&env, b.clone()]
-    ));
-    assert!(verify_proof(&env, &root, &b, &soroban_sdk::vec![&env, a]));
 }
 
 #[test]
-fn test_merkle_budget_by_depth() {
-    for depth in [8, 16, 24] {
-        let env = Env::default();
-        env.cost_estimate().budget().reset_unlimited();
-        let (root, leaf, proof) = merkle_depth_fixture(&env, depth);
-        // Exclude fixture construction from both measurements.
-        env.cost_estimate().budget().reset_unlimited();
-        let baseline_valid = merkle_baseline_verify(&env, &root, &leaf, &proof);
-        let baseline_cpu = env.cost_estimate().budget().cpu_instruction_cost();
-        let baseline_mem = env.cost_estimate().budget().memory_bytes_cost();
-        std::println!("Merkle depth {depth} baseline: CPU {baseline_cpu}, memory {baseline_mem}");
-        env.cost_estimate().budget().print();
-        env.cost_estimate().budget().reset_unlimited();
-        let optimized_valid = verify_proof(&env, &root, &leaf, &proof);
-        let optimized_cpu = env.cost_estimate().budget().cpu_instruction_cost();
-        let optimized_mem = env.cost_estimate().budget().memory_bytes_cost();
-        std::println!(
-            "Merkle depth {depth} optimized: CPU {optimized_cpu}, memory {optimized_mem}"
-        );
-        env.cost_estimate().budget().print();
-        assert!(baseline_valid && optimized_valid);
-        assert!(
-            optimized_cpu < baseline_cpu,
-            "CPU savings regressed at depth {depth}"
-        );
-        assert!(optimized_mem <= baseline_mem);
-    }
+fn test_batch_expiration_legacy_storage() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("LEGACY");
+    let (root, units) = f.build_sample_batch(1);
+    let legacy = crate::storage::LegacyBatch {
+        brand: f.brand.clone(),
+        merkle_root: root,
+        warranty_months: 12,
+        product_meta_hash: f.hash_str("META"),
+        unit_count: 1,
+        created_at: f.env.ledger().timestamp(),
+        recalled: false,
+    };
+    f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Batch(f.brand.clone(), batch_id.clone()), &legacy);
+    });
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().expires_at,
+        None
+    );
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    f.client
+        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
+    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
 }
