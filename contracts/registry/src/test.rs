@@ -8,7 +8,7 @@ use soroban_sdk::{
 };
 
 use crate::{
-    merkle::{compute_leaf, hash_pair, sha256_bytes, verify_proof, MAX_PROOF_DEPTH},
+    merkle::{compute_leaf, hash_pair, sha256_bytes, MAX_PROOF_DEPTH},
     storage::DataKey,
     types::{
         ClaimOutcome, RegistryError, UnitStatus, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
@@ -197,7 +197,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     let meta = f.hash_str("META");
     assert_eq!(
         f.client
-            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None),
+            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None, &None),
         Err(Ok(RegistryError::BrandNotVerified))
     );
     assert_eq!(
@@ -216,7 +216,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     assert_eq!(f.client.get_brand(&f.brand).unwrap().admin, rotated_signer);
 
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None);
+        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None, &None);
     assert!(f.client.get_batch(&f.brand, &batch_id).is_some());
 }
 
@@ -238,6 +238,7 @@ fn test_merkle_batch_commit_and_lazy_activation() {
             &12,
             &meta_hash,
             &0,
+            &None,
             &None
         ),
         Err(Ok(RegistryError::InvalidInput))
@@ -251,6 +252,7 @@ fn test_merkle_batch_commit_and_lazy_activation() {
         &meta_hash,
         &5,
         &None,
+        &None,
     );
 
     // Duplicate batch rejected
@@ -262,6 +264,7 @@ fn test_merkle_batch_commit_and_lazy_activation() {
             &12,
             &meta_hash,
             &5,
+            &None,
             &None
         ),
         Err(Ok(RegistryError::BatchExists))
@@ -373,6 +376,7 @@ fn test_resale_transfer_offer_redeem_expiry_and_cancel() {
         &meta_hash,
         &2,
         &None,
+        &None,
     );
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
@@ -449,8 +453,16 @@ fn test_warranty_boundary_and_claims_workflow() {
     let batch_id = f.hash_str("BATCH-CLAIMS");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(2);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &6, &meta_hash, &2, &None);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &6,
+        &meta_hash,
+        &2,
+        &None,
+        &None,
+    );
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
     let unit_id = f
@@ -537,6 +549,7 @@ fn test_flag_unit_and_recall_batch_across_entrypoints() {
         &meta_hash,
         &3,
         &None,
+        &None,
     );
 
     // Activate unit 0 and unit 1; leave unit 2 unactivated
@@ -620,6 +633,7 @@ fn test_ttl_extension_and_strict_authorization() {
         &meta_hash,
         &1,
         &None,
+        &None,
     );
 
     let unit_id = f.client.activate(
@@ -686,8 +700,16 @@ fn test_batch_expiration() {
     let meta = f.hash_str("META");
     let (root, units) = f.build_sample_batch(3);
     let expiry = f.env.ledger().timestamp() + 100;
-    f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &3, &Some(expiry));
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &root,
+        &12,
+        &meta,
+        &3,
+        &Some(expiry),
+        &None,
+    );
     assert_eq!(
         f.client.get_batch(&f.brand, &batch_id).unwrap().status,
         BatchStatus::Active
@@ -755,14 +777,22 @@ fn test_batch_expiration_invalid_commit_and_no_expiry() {
     let now = f.env.ledger().timestamp();
     for expiry in [0, now - 1, now] {
         assert_eq!(
-            f.client
-                .try_commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &Some(expiry)),
+            f.client.try_commit_batch(
+                &f.brand,
+                &batch_id,
+                &root,
+                &12,
+                &meta,
+                &1,
+                &Some(expiry),
+                &None
+            ),
             Err(Ok(RegistryError::InvalidInput))
         );
         assert!(f.client.get_batch(&f.brand, &batch_id).is_none());
     }
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &None);
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &None, &None);
     assert_eq!(
         f.client.get_batch(&f.brand, &batch_id).unwrap().expires_at,
         None

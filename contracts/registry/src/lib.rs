@@ -10,12 +10,12 @@ use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, V
 use crate::events::{
     BatchCommitted, BatchRecalled, BrandActionExecuted, BrandActionProposed, BrandRegistered,
     BrandVerified, ClaimFiled, ClaimResolved, DuplicateAttempt, ServiceCenterRegistered,
-    TransferCancelled, TransferOffered, UnitActivated, UnitFlagged, UnitTransferred,
+    TransferCancelled, TransferOffered, UnitActivated, UnitFlagged, UnitRetired, UnitTransferred,
 };
 use crate::types::{
-    Batch, BatchStatus, Brand, Claim, ClaimOutcome, Config, RegistryError, TransferOffer, Unit,
-    UnitStatus, UnitView, VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
-    SECONDS_PER_MONTH,
+    Batch, BatchStatus, Brand, BrandAction, BrandActionProposal, BrandAdminConfig, Claim,
+    ClaimOutcome, Config, RegistryError, TransferOffer, Unit, UnitRetirement, UnitStatus, UnitView,
+    VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT, SECONDS_PER_MONTH,
 };
 
 const MAX_DOMAIN_LEN: u32 = 253;
@@ -280,6 +280,7 @@ impl VeritagRegistry {
         product_meta_hash: BytesN<32>,
         unit_count: u64,
         expires_at: Option<u64>,
+        metadata_cid: Option<BytesN<32>>,
     ) -> Result<(), RegistryError> {
         if unit_count == 0 || expires_at.is_some_and(|expiry| expiry <= env.ledger().timestamp()) {
             return Err(RegistryError::InvalidInput);
@@ -721,7 +722,7 @@ impl VeritagRegistry {
             storage::get_batch(env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         batch.recalled = true;
         batch.status = BatchStatus::Recalled;
-        storage::set_batch(&env, &brand, &batch_id, &batch);
+        storage::set_batch(env, &brand, &batch_id, &batch);
 
         BatchRecalled {
             brand,

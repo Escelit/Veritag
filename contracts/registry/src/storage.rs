@@ -1,7 +1,8 @@
-use soroban_sdk::{contracttype, Address, BytesN, Env, Map, Symbol, TryFromVal, Val};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Map, String, Symbol, TryFromVal, Val, Vec};
 
 use crate::types::{
-    Batch, BatchStatus, Brand, Claim, Config, TransferOffer, Unit, SECONDS_PER_MONTH,
+    Batch, BatchStatus, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, TransferOffer,
+    Unit, UnitRetirement, SECONDS_PER_MONTH,
 };
 
 /// Storage layout used before optional expiration was introduced.
@@ -17,17 +18,13 @@ pub struct LegacyBatch {
     pub recalled: bool,
 }
 
-/// Storage layout used before optional document metadata was introduced.
 #[contracttype]
 #[derive(Clone)]
-pub struct LegacyBatch {
-    pub brand: Address,
-    pub merkle_root: BytesN<32>,
-    pub warranty_months: u32,
-    pub product_meta_hash: BytesN<32>,
-    pub unit_count: u64,
-    pub created_at: u64,
-    pub recalled: bool,
+pub struct LegacyBrand {
+    pub admin: Address,
+    pub domain: String,
+    pub verified: bool,
+    pub registered_at: u64,
 }
 
 /// Approximate Stellar ledger close interval (~5 seconds per ledger).
@@ -218,7 +215,7 @@ pub fn get_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> Option<Ba
         .storage()
         .persistent()
         .get(&DataKey::Batch(brand.clone(), batch_id.clone()))?;
-    let fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid batch storage");
+    let mut fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid batch storage");
     let mut batch = if fields.len() == 7 {
         let legacy = LegacyBatch::try_from_val(env, &value).expect("invalid batch storage");
         Batch {
@@ -226,6 +223,7 @@ pub fn get_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> Option<Ba
             merkle_root: legacy.merkle_root,
             warranty_months: legacy.warranty_months,
             product_meta_hash: legacy.product_meta_hash,
+            metadata_cid: None,
             unit_count: legacy.unit_count,
             created_at: legacy.created_at,
             recalled: legacy.recalled,
@@ -233,7 +231,10 @@ pub fn get_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> Option<Ba
             status: BatchStatus::Active,
         }
     } else {
-        Batch::try_from_val(env, &value).expect("invalid batch storage")
+        if !fields.contains_key(Symbol::new(env, "metadata_cid")) {
+            fields.set(Symbol::new(env, "metadata_cid"), Val::VOID.to_val());
+        }
+        Batch::try_from_val(env, &fields.to_val()).expect("invalid batch storage")
     };
     // Time advances without a transaction. Derive the effective status on every read.
     batch.status = if batch.recalled {
