@@ -227,12 +227,17 @@ pub fn get_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> Option<Ba
             unit_count: legacy.unit_count,
             created_at: legacy.created_at,
             recalled: legacy.recalled,
+            frozen: false,
             expires_at: None,
             status: BatchStatus::Active,
         }
     } else {
         if !fields.contains_key(Symbol::new(env, "metadata_cid")) {
             fields.set(Symbol::new(env, "metadata_cid"), Val::VOID.to_val());
+        }
+        // Batches stored before freezing default to an unfrozen state.
+        if !fields.contains_key(Symbol::new(env, "frozen")) {
+            fields.set(Symbol::new(env, "frozen"), Val::FALSE.to_val());
         }
         Batch::try_from_val(env, &fields.to_val()).expect("invalid batch storage")
     };

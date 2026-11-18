@@ -8,9 +8,10 @@ pub mod types;
 use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
 use crate::events::{
-    BatchCommitted, BatchRecalled, BrandActionExecuted, BrandActionProposed, BrandRegistered,
-    BrandVerified, ClaimFiled, ClaimResolved, DuplicateAttempt, ServiceCenterRegistered,
-    TransferCancelled, TransferOffered, UnitActivated, UnitFlagged, UnitRetired, UnitTransferred,
+    BatchCommitted, BatchFrozen, BatchRecalled, BatchUnfrozen, BrandActionExecuted,
+    BrandActionProposed, BrandRegistered, BrandVerified, ClaimFiled, ClaimResolved,
+    DuplicateAttempt, ServiceCenterRegistered, TransferCancelled, TransferOffered, UnitActivated,
+    UnitFlagged, UnitRetired, UnitTransferred,
 };
 use crate::types::{
     Batch, BatchStatus, Brand, BrandAction, BrandActionProposal, BrandAdminConfig, Claim,
@@ -301,6 +302,7 @@ impl VeritagRegistry {
             unit_count,
             created_at: env.ledger().timestamp(),
             recalled: false,
+            frozen: false,
             expires_at,
             status: BatchStatus::Active,
         };
@@ -345,6 +347,9 @@ impl VeritagRegistry {
             storage::get_batch(&env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         if batch.recalled {
             return Err(RegistryError::BatchRecalled);
+        }
+        if batch.frozen {
+            return Err(RegistryError::BatchFrozen);
         }
         if batch.status == BatchStatus::Expired {
             return Err(RegistryError::BatchExpired);
@@ -579,7 +584,10 @@ impl VeritagRegistry {
     ) -> Result<u32, RegistryError> {
         let config = storage::get_config(&env).ok_or(RegistryError::NotInitialized)?;
         let mut unit = storage::get_unit(&env, &unit_id).ok_or(RegistryError::UnitNotFound)?;
-        Self::ensure_unit_operational(&env, &unit)?;
+        let batch = Self::ensure_unit_operational(&env, &unit)?;
+        if batch.frozen {
+            return Err(RegistryError::BatchFrozen);
+        }
         unit.owner.require_auth();
 
         if !storage::is_service_center(&env, &unit.brand, &service_center) {
@@ -673,6 +681,51 @@ impl VeritagRegistry {
     // -------------------------------------------------------------------------
     // Safety, Anti-Counterfeit Flags & Recalls
     // -------------------------------------------------------------------------
+
+    /// Temporarily suspends activations and new warranty claims (brand admin only).
+    pub fn freeze_batch(
+        env: Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+    ) -> Result<(), RegistryError> {
+        let record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        Self::require_single_brand_admin(&record)?;
+        Self::set_batch_frozen_internal(&env, brand, batch_id, true)
+    }
+
+    /// Clears a temporary suspension without reversing a permanent recall (brand admin only).
+    pub fn unfreeze_batch(
+        env: Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+    ) -> Result<(), RegistryError> {
+        let record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        Self::require_single_brand_admin(&record)?;
+        Self::set_batch_frozen_internal(&env, brand, batch_id, false)
+    }
+
+    fn set_batch_frozen_internal(
+        env: &Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+        frozen: bool,
+    ) -> Result<(), RegistryError> {
+        let mut batch =
+            storage::get_batch(env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
+        if batch.recalled {
+            return Err(RegistryError::BatchRecalled);
+        }
+        if batch.frozen != frozen {
+            batch.frozen = frozen;
+            storage::set_batch(env, &brand, &batch_id, &batch);
+            if frozen {
+                BatchFrozen { brand, batch_id }.publish(env);
+            } else {
+                BatchUnfrozen { brand, batch_id }.publish(env);
+            }
+        }
+        Ok(())
+    }
 
     /// Flags an individual unit as compromised, stolen, or counterfeit (brand admin only).
     pub fn flag_unit(
@@ -943,7 +996,7 @@ impl VeritagRegistry {
         Ok(record)
     }
 
-    fn ensure_unit_operational(env: &Env, unit: &Unit) -> Result<(), RegistryError> {
+    fn ensure_unit_operational(env: &Env, unit: &Unit) -> Result<Batch, RegistryError> {
         Self::ensure_unit_not_retired(unit)?;
         let batch = storage::get_batch(env, &unit.brand, &unit.batch_id)
             .ok_or(RegistryError::BatchNotFound)?;
@@ -953,7 +1006,7 @@ impl VeritagRegistry {
         if unit.status == UnitStatus::Flagged {
             return Err(RegistryError::UnitFlagged);
         }
-        Ok(())
+        Ok(batch)
     }
 
     fn ensure_unit_not_retired(unit: &Unit) -> Result<(), RegistryError> {
@@ -1054,6 +1107,13 @@ impl VeritagRegistry {
         action: &BrandAction,
     ) -> Result<(), RegistryError> {
         match action {
+            BrandAction::FreezeBatch(batch_id) | BrandAction::UnfreezeBatch(batch_id) => {
+                let batch =
+                    storage::get_batch(env, brand, batch_id).ok_or(RegistryError::BatchNotFound)?;
+                if batch.recalled {
+                    return Err(RegistryError::BatchRecalled);
+                }
+            }
             BrandAction::RecallBatch(batch_id, _) => {
                 storage::get_batch(env, brand, batch_id).ok_or(RegistryError::BatchNotFound)?;
             }
@@ -1077,6 +1137,12 @@ impl VeritagRegistry {
             return Err(RegistryError::NotAuthorized);
         }
         match &proposal.action {
+            BrandAction::FreezeBatch(batch_id) => {
+                Self::set_batch_frozen_internal(env, brand.clone(), batch_id.clone(), true)?
+            }
+            BrandAction::UnfreezeBatch(batch_id) => {
+                Self::set_batch_frozen_internal(env, brand.clone(), batch_id.clone(), false)?
+            }
             BrandAction::RecallBatch(batch_id, reason_hash) => Self::recall_batch_internal(
                 env,
                 brand.clone(),
