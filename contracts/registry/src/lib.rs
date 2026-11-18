@@ -377,6 +377,7 @@ impl VeritagRegistry {
             owner: first_owner.clone(),
             status: UnitStatus::Active,
             activated_at: now,
+            last_transferred_at: 0,
             warranty_expiry,
             claims_used: 0,
             history_len: 1,
@@ -489,6 +490,11 @@ impl VeritagRegistry {
         unit.owner.require_auth();
 
         let now = env.ledger().timestamp();
+        // Subtract rather than adding to last_transferred_at so the cooldown
+        // cannot wrap near u64::MAX or be bypassed by an earlier timestamp.
+        if now.saturating_sub(unit.last_transferred_at) < TRANSFER_COOLDOWN_SECONDS {
+            return Err(RegistryError::TransferCooldownActive);
+        }
         if expires_at <= now {
             return Err(RegistryError::InvalidInput);
         }
@@ -537,6 +543,7 @@ impl VeritagRegistry {
 
         let previous_owner = unit.owner.clone();
         unit.owner = new_owner.clone();
+        unit.last_transferred_at = env.ledger().timestamp();
         unit.history_len = unit.history_len.saturating_add(1);
 
         storage::remove_offer(&env, &unit_id);

@@ -135,6 +135,7 @@ pub struct Unit {
     pub owner: Address,
     pub status: UnitStatus,
     pub activated_at: u64,
+    pub last_transferred_at: u64,
     pub warranty_expiry: u64,
     pub claims_used: u32,
     pub history_len: u32,

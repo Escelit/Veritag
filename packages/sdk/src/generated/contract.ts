@@ -41,6 +41,7 @@ export interface Unit {
   claims_used: u32;
   duplicate_attempts: u32;
   history_len: u32;
+  last_transferred_at: u64;
   owner: string;
   status: UnitStatus;
   warranty_expiry: u64;
