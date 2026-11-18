@@ -64,6 +64,16 @@ pub struct BatchCommitted {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchTransferLimitUpdated {
+    #[topic]
+    pub brand: Address,
+    #[topic]
+    pub batch_id: BytesN<32>,
+    pub max_transfers: Option<u32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnitActivated {
     #[topic]
     pub unit_id: BytesN<32>,
@@ -113,6 +123,7 @@ pub struct UnitTransferred {
     pub unit_id: BytesN<32>,
     pub from: Address,
     pub to: Address,
+    pub transfer_count: u32,
 }
 
 #[contractevent]
@@ -163,4 +174,22 @@ pub struct BatchRecalled {
     pub notice_hash: BytesN<32>,
     /// Mirrors notice_hash for existing indexer consumers.
     pub reason_hash: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchFrozen {
+    #[topic]
+    pub brand: Address,
+    #[topic]
+    pub batch_id: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchUnfrozen {
+    #[topic]
+    pub brand: Address,
+    #[topic]
+    pub batch_id: BytesN<32>,
 }
