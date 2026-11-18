@@ -678,95 +678,119 @@ fn test_ttl_extension_and_strict_authorization() {
 }
 
 #[test]
-fn test_batch_metadata_cid() {
-    use crate::events::BatchCommitted;
-    use soroban_sdk::events::Event;
-    for with_metadata in [true, false] {
-        let f = TestFixture::setup();
-        f.setup_verified_brand();
-        let batch_id = f.hash_str("METADATA");
-        let meta = f.hash_str("PRODUCT");
-        let metadata_cid = with_metadata.then(|| f.hash_str("COMPLIANCE-CERTIFICATE"));
-        let (root, units) = f.build_sample_batch(1);
-        assert_eq!(f.client.get_batch_metadata_cid(&f.brand, &batch_id), None);
-        f.client
-            .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &metadata_cid);
-        let event = BatchCommitted {
-            brand: f.brand.clone(),
-            batch_id: batch_id.clone(),
-            root,
-            warranty_months: 12,
-            unit_count: 1,
-            metadata_cid: metadata_cid.clone(),
-        };
-        assert_eq!(
-            f.env.events().all(),
-            Vec::from_array(
-                &f.env,
-                [(
-                    f.contract_id.clone(),
-                    event.topics(&f.env),
-                    event.data(&f.env)
-                )]
-            )
-        );
-        assert_eq!(
-            f.client.get_batch_metadata_cid(&f.brand, &batch_id),
-            metadata_cid
-        );
-        let batch = f.client.get_batch(&f.brand, &batch_id).unwrap();
-        assert_eq!(batch.metadata_cid, metadata_cid);
-        assert_eq!(batch.product_meta_hash, meta);
-        f.client.activate(
-            &f.brand,
-            &batch_id,
-            &units[0].0,
-            &units[0].3,
-            &units[0].1,
-            &f.alice,
-        );
-    }
-}
-
-#[test]
-fn test_batch_metadata_cid_is_immutable() {
+fn test_batch_expiration() {
+    use crate::types::BatchStatus;
     let f = TestFixture::setup();
     f.setup_verified_brand();
-    let batch_id = f.hash_str("IMMUTABLE");
-    let root = f.hash_str("ROOT");
+    let batch_id = f.hash_str("PERISHABLES");
     let meta = f.hash_str("META");
-    let cid = Some(f.hash_str("DOCUMENT-V1"));
+    let (root, units) = f.build_sample_batch(3);
+    let expiry = f.env.ledger().timestamp() + 100;
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &cid);
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &3, &Some(expiry));
     assert_eq!(
-        f.client.try_commit_batch(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Active
+    );
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    f.env.ledger().with_mut(|li| li.timestamp = expiry);
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[1].0,
+        &units[1].3,
+        &units[1].1,
+        &f.alice,
+    );
+    f.env.ledger().with_mut(|li| li.timestamp = expiry + 1);
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Expired
+    );
+    assert_eq!(
+        f.client.try_activate(
             &f.brand,
             &batch_id,
-            &root,
-            &12,
-            &meta,
-            &1,
-            &Some(f.hash_str("DOCUMENT-V2"))
+            &units[2].0,
+            &units[2].3,
+            &units[2].1,
+            &f.alice
         ),
-        Err(Ok(RegistryError::BatchExists))
+        Err(Ok(RegistryError::BatchExpired))
     );
-    assert_eq!(f.client.get_batch_metadata_cid(&f.brand, &batch_id), cid);
+    let unit_id = f.client.compute_unit_id(&f.brand, &batch_id, &units[2].0);
+    assert!(f.client.get_unit(&unit_id).is_none());
     f.client.recall_batch(&f.brand, &batch_id, &meta);
-    assert_eq!(f.client.get_batch_metadata_cid(&f.brand, &batch_id), cid);
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Recalled
+    );
+    assert_eq!(
+        f.client.try_activate(
+            &f.brand,
+            &batch_id,
+            &units[2].0,
+            &units[2].3,
+            &units[2].1,
+            &f.alice
+        ),
+        Err(Ok(RegistryError::BatchRecalled))
+    );
 }
 
 #[test]
-fn test_batch_metadata_cid_legacy_storage() {
+fn test_batch_expiration_invalid_commit_and_no_expiry() {
     let f = TestFixture::setup();
     f.setup_verified_brand();
-    let batch_id = f.hash_str("LEGACY-METADATA");
-    let meta = f.hash_str("LEGACY-PRODUCT");
+    let batch_id = f.hash_str("NO-EXPIRY");
+    let meta = f.hash_str("META");
+    let (root, units) = f.build_sample_batch(1);
+    let now = f.env.ledger().timestamp();
+    for expiry in [0, now - 1, now] {
+        assert_eq!(
+            f.client
+                .try_commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &Some(expiry)),
+            Err(Ok(RegistryError::InvalidInput))
+        );
+        assert!(f.client.get_batch(&f.brand, &batch_id).is_none());
+    }
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &None);
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().expires_at,
+        None
+    );
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = now + SECONDS_PER_MONTH * 120);
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+}
+
+#[test]
+fn test_batch_expiration_legacy_storage() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("LEGACY");
     let (root, units) = f.build_sample_batch(1);
     let legacy = crate::storage::LegacyBatch {
         brand: f.brand.clone(),
         merkle_root: root,
         warranty_months: 12,
-        product_meta_hash: meta.clone(),
+        product_meta_hash: f.hash_str("META"),
         unit_count: 1,
         created_at: f.env.ledger().timestamp(),
         recalled: false,
@@ -775,15 +799,11 @@ fn test_batch_metadata_cid_legacy_storage() {
         f.env
             .storage()
             .persistent()
-            .set(&DataKey::Batch(f.brand.clone(), batch_id.clone()), &legacy)
+            .set(&DataKey::Batch(f.brand.clone(), batch_id.clone()), &legacy);
     });
-    assert_eq!(f.client.get_batch_metadata_cid(&f.brand, &batch_id), None);
     assert_eq!(
-        f.client
-            .get_batch(&f.brand, &batch_id)
-            .unwrap()
-            .product_meta_hash,
-        meta
+        f.client.get_batch(&f.brand, &batch_id).unwrap().expires_at,
+        None
     );
     f.client.activate(
         &f.brand,
@@ -795,5 +815,5 @@ fn test_batch_metadata_cid_legacy_storage() {
     );
     f.client
         .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
-    assert_eq!(f.client.get_batch_metadata_cid(&f.brand, &batch_id), None);
+    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
 }

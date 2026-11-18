@@ -8,13 +8,14 @@ pub mod types;
 use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
 use crate::events::{
-    BatchCommitted, BatchRecalled, BrandRegistered, BrandVerified, ClaimFiled, ClaimResolved,
-    DuplicateAttempt, ServiceCenterRegistered, TransferCancelled, TransferOffered, UnitActivated,
-    UnitFlagged, UnitTransferred,
+    BatchCommitted, BatchRecalled, BrandActionExecuted, BrandActionProposed, BrandRegistered,
+    BrandVerified, ClaimFiled, ClaimResolved, DuplicateAttempt, ServiceCenterRegistered,
+    TransferCancelled, TransferOffered, UnitActivated, UnitFlagged, UnitTransferred,
 };
 use crate::types::{
-    Batch, Brand, Claim, ClaimOutcome, Config, RegistryError, TransferOffer, Unit, UnitStatus,
-    UnitView, VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT, SECONDS_PER_MONTH,
+    Batch, BatchStatus, Brand, Claim, ClaimOutcome, Config, RegistryError, TransferOffer, Unit,
+    UnitStatus, UnitView, VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
+    SECONDS_PER_MONTH,
 };
 
 const MAX_DOMAIN_LEN: u32 = 253;
@@ -86,6 +87,12 @@ impl VeritagRegistry {
             domain: domain.clone(),
             verified: false,
             registered_at: env.ledger().timestamp(),
+            admin_config: BrandAdminConfig {
+                admins: Vec::from_array(&env, [brand.clone()]),
+                threshold: 1,
+            },
+            admin_generation: 0,
+            next_action_id: 0,
         };
         storage::set_brand(&env, &brand, &record);
         storage::extend_instance_ttl(&env);
@@ -115,12 +122,108 @@ impl VeritagRegistry {
         new_admin: Address,
     ) -> Result<(), RegistryError> {
         let mut record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
-        record.admin.require_auth();
+        Self::require_single_brand_admin(&record)?;
         new_admin.require_auth();
 
-        record.admin = new_admin;
-        storage::set_brand(&env, &brand, &record);
+        Self::replace_brand_admins(
+            &env,
+            &brand,
+            &mut record,
+            BrandAdminConfig {
+                admins: Vec::from_array(&env, [new_admin]),
+                threshold: 1,
+            },
+        )?;
         Ok(())
+    }
+
+    /// Configures initial threshold governance; later changes require an approved action.
+    pub fn configure_brand_admins(
+        env: Env,
+        brand: Address,
+        config: BrandAdminConfig,
+    ) -> Result<(), RegistryError> {
+        Self::validate_admin_config(&config)?;
+        let mut record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        Self::require_single_brand_admin(&record)?;
+        Self::replace_brand_admins(&env, &brand, &mut record, config)
+    }
+
+    /// Proposes a sensitive action and records the authenticated proposer's first approval.
+    pub fn propose_brand_action(
+        env: Env,
+        caller: Address,
+        brand: Address,
+        action: BrandAction,
+    ) -> Result<u32, RegistryError> {
+        let mut record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        Self::require_brand_voter(&record, &caller)?;
+        Self::validate_brand_action(&env, &brand, &record, &action)?;
+        let proposal_id = record.next_action_id;
+        record.next_action_id = proposal_id
+            .checked_add(1)
+            .ok_or(RegistryError::InvalidInput)?;
+        storage::set_brand(&env, &brand, &record);
+        let mut proposal = BrandActionProposal {
+            action: action.clone(),
+            caller: caller.clone(),
+            approvals: Vec::from_array(&env, [caller.clone()]),
+            admin_generation: record.admin_generation,
+            executed: false,
+        };
+        BrandActionProposed {
+            brand: brand.clone(),
+            proposal_id,
+            caller,
+            action,
+        }
+        .publish(&env);
+        if record.admin_config.threshold == 1 {
+            Self::execute_brand_action(&env, &brand, proposal_id, &mut record, &mut proposal)?;
+        }
+        storage::set_brand_action(&env, &brand, proposal_id, &proposal);
+        storage::extend_instance_ttl(&env);
+        Ok(proposal_id)
+    }
+
+    /// Adds one authenticated admin approval and executes only when the threshold is met.
+    pub fn approve_brand_action(
+        env: Env,
+        caller: Address,
+        brand: Address,
+        proposal_id: u32,
+    ) -> Result<bool, RegistryError> {
+        let mut record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        Self::require_brand_voter(&record, &caller)?;
+        let mut proposal = storage::get_brand_action(&env, &brand, proposal_id)
+            .ok_or(RegistryError::InvalidInput)?;
+        if proposal.executed
+            || proposal.admin_generation != record.admin_generation
+            || proposal.approvals.contains(&caller)
+        {
+            return Err(RegistryError::NotAuthorized);
+        }
+        proposal.approvals.push_back(caller);
+        if proposal.approvals.len() >= record.admin_config.threshold {
+            Self::validate_brand_action(&env, &brand, &record, &proposal.action)?;
+            Self::execute_brand_action(&env, &brand, proposal_id, &mut record, &mut proposal)?;
+        }
+        storage::set_brand(&env, &brand, &record);
+        storage::set_brand_action(&env, &brand, proposal_id, &proposal);
+        storage::extend_instance_ttl(&env);
+        Ok(proposal.executed)
+    }
+
+    pub fn get_brand_admin_config(env: Env, brand: Address) -> Option<BrandAdminConfig> {
+        storage::get_brand(&env, &brand).map(|record| record.admin_config)
+    }
+
+    pub fn get_brand_action(
+        env: Env,
+        brand: Address,
+        proposal_id: u32,
+    ) -> Option<BrandActionProposal> {
+        storage::get_brand_action(&env, &brand, proposal_id)
     }
 
     /// Authorizes a service center to resolve warranty claims for a verified brand.
@@ -130,7 +233,7 @@ impl VeritagRegistry {
         service_center: Address,
     ) -> Result<(), RegistryError> {
         let brand_record = Self::require_verified_brand(&env, &brand)?;
-        brand_record.admin.require_auth();
+        Self::require_single_brand_admin(&brand_record)?;
 
         storage::set_service_center(&env, &brand, &service_center, true);
         ServiceCenterRegistered {
@@ -149,7 +252,7 @@ impl VeritagRegistry {
         service_center: Address,
     ) -> Result<(), RegistryError> {
         let brand_record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
-        brand_record.admin.require_auth();
+        Self::require_single_brand_admin(&brand_record)?;
 
         storage::set_service_center(&env, &brand, &service_center, false);
         ServiceCenterRegistered {
@@ -166,7 +269,7 @@ impl VeritagRegistry {
     // -------------------------------------------------------------------------
 
     /// Commits a production batch Merkle root for a verified brand.
-    // Preserve the existing Soroban ABI arguments alongside optional metadata.
+    // Keep the existing Soroban ABI arguments alongside optional expiration.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_batch(
         env: Env,
@@ -176,9 +279,9 @@ impl VeritagRegistry {
         warranty_months: u32,
         product_meta_hash: BytesN<32>,
         unit_count: u64,
-        metadata_cid: Option<BytesN<32>>,
+        expires_at: Option<u64>,
     ) -> Result<(), RegistryError> {
-        if unit_count == 0 {
+        if unit_count == 0 || expires_at.is_some_and(|expiry| expiry <= env.ledger().timestamp()) {
             return Err(RegistryError::InvalidInput);
         }
         let brand_record = Self::require_verified_brand(&env, &brand)?;
@@ -197,6 +300,8 @@ impl VeritagRegistry {
             unit_count,
             created_at: env.ledger().timestamp(),
             recalled: false,
+            expires_at,
+            status: BatchStatus::Active,
         };
         storage::set_batch(&env, &brand, &batch_id, &batch);
         storage::extend_instance_ttl(&env);
@@ -233,6 +338,9 @@ impl VeritagRegistry {
             storage::get_batch(&env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         if batch.recalled {
             return Err(RegistryError::BatchRecalled);
+        }
+        if batch.status == BatchStatus::Expired {
+            return Err(RegistryError::BatchExpired);
         }
 
         let unit_id = merkle::compute_unit_id(&env, &brand, &batch_id, &serial_hash);
@@ -551,11 +659,21 @@ impl VeritagRegistry {
         reason_hash: BytesN<32>,
     ) -> Result<(), RegistryError> {
         let brand_record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
-        brand_record.admin.require_auth();
+        Self::require_single_brand_admin(&brand_record)?;
 
+        Self::recall_batch_internal(&env, brand, batch_id, reason_hash)
+    }
+
+    fn recall_batch_internal(
+        env: &Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+        reason_hash: BytesN<32>,
+    ) -> Result<(), RegistryError> {
         let mut batch =
-            storage::get_batch(&env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
+            storage::get_batch(env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         batch.recalled = true;
+        batch.status = BatchStatus::Recalled;
         storage::set_batch(&env, &brand, &batch_id, &batch);
 
         BatchRecalled {
@@ -563,7 +681,7 @@ impl VeritagRegistry {
             batch_id,
             reason_hash,
         }
-        .publish(&env);
+        .publish(env);
         Ok(())
     }
 
@@ -817,6 +935,121 @@ impl VeritagRegistry {
             duplicate_attempts: unit.duplicate_attempts,
             batch_recalled,
         }
+    }
+}
+
+impl VeritagRegistry {
+    fn validate_admin_config(config: &BrandAdminConfig) -> Result<(), RegistryError> {
+        if config.admins.is_empty()
+            || config.admins.len() > 32
+            || config.threshold == 0
+            || config.threshold > config.admins.len()
+        {
+            return Err(RegistryError::InvalidInput);
+        }
+        let mut seen = Vec::new(config.admins.env());
+        for admin in config.admins.iter() {
+            if seen.contains(&admin) {
+                return Err(RegistryError::InvalidInput);
+            }
+            seen.push_back(admin);
+        }
+        Ok(())
+    }
+
+    fn require_single_brand_admin(record: &Brand) -> Result<(), RegistryError> {
+        if record.admin_config.threshold != 1 {
+            return Err(RegistryError::NotAuthorized);
+        }
+        record.admin.require_auth();
+        Ok(())
+    }
+
+    fn require_brand_voter(record: &Brand, caller: &Address) -> Result<(), RegistryError> {
+        if !record.admin_config.admins.contains(caller) {
+            return Err(RegistryError::NotAuthorized);
+        }
+        caller.require_auth();
+        Ok(())
+    }
+
+    fn replace_brand_admins(
+        env: &Env,
+        brand: &Address,
+        record: &mut Brand,
+        config: BrandAdminConfig,
+    ) -> Result<(), RegistryError> {
+        Self::validate_admin_config(&config)?;
+        record.admin_generation = record
+            .admin_generation
+            .checked_add(1)
+            .ok_or(RegistryError::InvalidInput)?;
+        record.admin = config.admins.get(0).ok_or(RegistryError::InvalidInput)?;
+        record.admin_config = config;
+        storage::set_brand(env, brand, record);
+        Ok(())
+    }
+
+    fn validate_brand_action(
+        env: &Env,
+        brand: &Address,
+        record: &Brand,
+        action: &BrandAction,
+    ) -> Result<(), RegistryError> {
+        match action {
+            BrandAction::RecallBatch(batch_id, _) => {
+                storage::get_batch(env, brand, batch_id).ok_or(RegistryError::BatchNotFound)?;
+            }
+            BrandAction::RegisterServiceCenter(_) if !record.verified => {
+                return Err(RegistryError::BrandNotVerified)
+            }
+            BrandAction::ConfigureAdmins(config) => Self::validate_admin_config(config)?,
+            _ => (),
+        }
+        Ok(())
+    }
+
+    fn execute_brand_action(
+        env: &Env,
+        brand: &Address,
+        proposal_id: u32,
+        record: &mut Brand,
+        proposal: &mut BrandActionProposal,
+    ) -> Result<(), RegistryError> {
+        if proposal.executed || proposal.approvals.len() < record.admin_config.threshold {
+            return Err(RegistryError::NotAuthorized);
+        }
+        match &proposal.action {
+            BrandAction::RecallBatch(batch_id, reason_hash) => Self::recall_batch_internal(
+                env,
+                brand.clone(),
+                batch_id.clone(),
+                reason_hash.clone(),
+            )?,
+            BrandAction::RegisterServiceCenter(center)
+            | BrandAction::RevokeServiceCenter(center) => {
+                let authorized = matches!(proposal.action, BrandAction::RegisterServiceCenter(_));
+                storage::set_service_center(env, brand, center, authorized);
+                ServiceCenterRegistered {
+                    brand: brand.clone(),
+                    service_center: center.clone(),
+                    authorized,
+                }
+                .publish(env);
+            }
+            BrandAction::ConfigureAdmins(config) => {
+                Self::replace_brand_admins(env, brand, record, config.clone())?
+            }
+        }
+        proposal.executed = true;
+        BrandActionExecuted {
+            brand: brand.clone(),
+            proposal_id,
+            action: proposal.action.clone(),
+            approvals: proposal.approvals.clone(),
+        }
+        .publish(env);
+        Ok(())
     }
 }
 

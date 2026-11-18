@@ -1,6 +1,28 @@
-use soroban_sdk::{contractevent, Address, BytesN, String};
+use soroban_sdk::{contractevent, Address, BytesN, String, Vec};
 
-use crate::types::ClaimOutcome;
+use crate::types::{BrandAction, ClaimOutcome};
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrandActionProposed {
+    #[topic]
+    pub brand: Address,
+    #[topic]
+    pub proposal_id: u32,
+    pub caller: Address,
+    pub action: BrandAction,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrandActionExecuted {
+    #[topic]
+    pub brand: Address,
+    #[topic]
+    pub proposal_id: u32,
+    pub action: BrandAction,
+    pub approvals: Vec<Address>,
+}
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
