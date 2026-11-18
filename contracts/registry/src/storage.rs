@@ -267,9 +267,17 @@ pub fn has_unit(env: &Env, unit_id: &BytesN<32>) -> bool {
 }
 
 pub fn get_unit(env: &Env, unit_id: &BytesN<32>) -> Option<Unit> {
-    env.storage()
+    let value: Val = env
+        .storage()
         .persistent()
-        .get(&DataKey::Unit(unit_id.clone()))
+        .get(&DataKey::Unit(unit_id.clone()))?;
+    let mut fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid unit storage");
+    let timestamp_key = Symbol::new(env, "last_transferred_at");
+    if !fields.contains_key(timestamp_key.clone()) {
+        fields.set(timestamp_key, 0u64.into_val(env));
+    }
+    let normalized: Val = fields.into_val(env);
+    Some(Unit::try_from_val(env, &normalized).expect("invalid unit storage"))
 }
 
 pub fn set_unit(env: &Env, unit_id: &BytesN<32>, unit: &Unit) {
