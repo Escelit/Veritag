@@ -7,6 +7,9 @@ pub const DEFAULT_MAX_CLAIMS_PER_UNIT: u32 = 5;
 /// Using 30 days (2,592,000 seconds) for deterministic, transparent on-chain calculation.
 pub const SECONDS_PER_MONTH: u64 = 30 * 24 * 60 * 60;
 
+/// Minimum interval between completed custody transfers of a unit.
+pub const TRANSFER_COOLDOWN_SECONDS: u64 = 3600;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -35,6 +38,7 @@ pub enum RegistryError {
     InvalidInput = 22,
     UnitRetired = 23,
     BatchExpired = 24,
+    TransferCooldownActive = 26,
 }
 
 #[contracttype]
@@ -131,6 +135,7 @@ pub struct Unit {
     pub owner: Address,
     pub status: UnitStatus,
     pub activated_at: u64,
+    pub last_transferred_at: u64,
     pub warranty_expiry: u64,
     pub claims_used: u32,
     pub history_len: u32,

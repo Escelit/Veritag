@@ -10,12 +10,13 @@ use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, V
 use crate::events::{
     BatchCommitted, BatchRecalled, BrandActionExecuted, BrandActionProposed, BrandRegistered,
     BrandVerified, ClaimFiled, ClaimResolved, DuplicateAttempt, ServiceCenterRegistered,
-    TransferCancelled, TransferOffered, UnitActivated, UnitFlagged, UnitTransferred,
+    TransferCancelled, TransferOffered, UnitActivated, UnitFlagged, UnitRetired, UnitTransferred,
 };
 use crate::types::{
-    Batch, BatchStatus, Brand, Claim, ClaimOutcome, Config, RegistryError, TransferOffer, Unit,
-    UnitStatus, UnitView, VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
-    SECONDS_PER_MONTH,
+    Batch, BatchStatus, Brand, BrandAction, BrandActionProposal, BrandAdminConfig, Claim,
+    ClaimOutcome, Config, RegistryError, TransferOffer, Unit, UnitRetirement, UnitStatus, UnitView,
+    VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT, SECONDS_PER_MONTH,
+    TRANSFER_COOLDOWN_SECONDS,
 };
 
 const MAX_DOMAIN_LEN: u32 = 253;
@@ -269,7 +270,7 @@ impl VeritagRegistry {
     // -------------------------------------------------------------------------
 
     /// Commits a production batch Merkle root for a verified brand.
-    // Keep the existing Soroban ABI arguments alongside optional expiration.
+    // Preserve both optional expiration and metadata from the merged batch features.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_batch(
         env: Env,
@@ -280,6 +281,7 @@ impl VeritagRegistry {
         product_meta_hash: BytesN<32>,
         unit_count: u64,
         expires_at: Option<u64>,
+        metadata_cid: Option<BytesN<32>>,
     ) -> Result<(), RegistryError> {
         if unit_count == 0 || expires_at.is_some_and(|expiry| expiry <= env.ledger().timestamp()) {
             return Err(RegistryError::InvalidInput);
@@ -374,6 +376,7 @@ impl VeritagRegistry {
             owner: first_owner.clone(),
             status: UnitStatus::Active,
             activated_at: now,
+            last_transferred_at: 0,
             warranty_expiry,
             claims_used: 0,
             history_len: 1,
@@ -486,6 +489,11 @@ impl VeritagRegistry {
         unit.owner.require_auth();
 
         let now = env.ledger().timestamp();
+        // Subtract rather than adding to last_transferred_at so the cooldown
+        // cannot wrap near u64::MAX or be bypassed by an earlier timestamp.
+        if now.saturating_sub(unit.last_transferred_at) < TRANSFER_COOLDOWN_SECONDS {
+            return Err(RegistryError::TransferCooldownActive);
+        }
         if expires_at <= now {
             return Err(RegistryError::InvalidInput);
         }
@@ -534,6 +542,7 @@ impl VeritagRegistry {
 
         let previous_owner = unit.owner.clone();
         unit.owner = new_owner.clone();
+        unit.last_transferred_at = env.ledger().timestamp();
         unit.history_len = unit.history_len.saturating_add(1);
 
         storage::remove_offer(&env, &unit_id);
@@ -721,7 +730,7 @@ impl VeritagRegistry {
             storage::get_batch(env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         batch.recalled = true;
         batch.status = BatchStatus::Recalled;
-        storage::set_batch(&env, &brand, &batch_id, &batch);
+        storage::set_batch(env, &brand, &batch_id, &batch);
 
         BatchRecalled {
             brand,
