@@ -110,6 +110,17 @@ export interface UnitView {
   warranty_valid: boolean;
 }
 
+
+export interface RecallInfo {
+  notice_hash: Buffer;
+  recalled_at: u64;
+  /**
+ * 1: critical/life safety; 2: functional defect; 3: cosmetic/labeling.
+ * Soroban represents small unsigned integers as u32 in its contract ABI.
+ */
+severity: u32;
+}
+
 export enum UnitStatus {
   Active = 0,
   Flagged = 1,
@@ -329,9 +340,9 @@ export interface Client {
 
   /**
    * Construct and simulate a recall_batch transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Recalls an entire production batch immediately (brand admin only).
+   * Recalls a batch with a severity tier (1..=3) and regulatory notice digest (brand admin only).
    */
-  recall_batch: ({brand, batch_id, reason_hash}: {brand: string, batch_id: Buffer, reason_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  recall_batch: ({brand, batch_id, severity, notice_hash}: {brand: string, batch_id: Buffer, severity: u32, notice_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
    * Construct and simulate a rotate_admin transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -462,6 +473,11 @@ export interface Client {
   create_transfer_offer: ({unit_id, code_hash, expires_at}: {unit_id: Buffer, code_hash: Buffer, expires_at: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a get_batch_recall_info transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  get_batch_recall_info: ({brand, batch_id}: {brand: string, batch_id: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Option<RecallInfo>>>
+
+  /**
    * Construct and simulate a revoke_service_center transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Revokes a service center's authorization for a brand.
    */
@@ -557,6 +573,7 @@ export class Client extends ContractClient {
         "AAAAAAAAAFRQcm9wb3NlcyBhIHNlbnNpdGl2ZSBhY3Rpb24gYW5kIHJlY29yZHMgdGhlIGF1dGhlbnRpY2F0ZWQgcHJvcG9zZXIncyBmaXJzdCBhcHByb3ZhbC4AAAAUcHJvcG9zZV9icmFuZF9hY3Rpb24AAAADAAAAAAAAAAZjYWxsZXIAAAAAABMAAAAAAAAABWJyYW5kAAAAAAAAEwAAAAAAAAAGYWN0aW9uAAAAAAfQAAAAC0JyYW5kQWN0aW9uAAAAAAEAAAPpAAAABAAAB9AAAAANUmVnaXN0cnlFcnJvcgAAAA==",
         "AAAAAAAAAD1DYW5jZWxzIGFuIGFjdGl2ZSByZXNhbGUgdHJhbnNmZXIgb2ZmZXIgKGN1cnJlbnQgb3duZXIgb25seSkuAAAAAAAAFWNhbmNlbF90cmFuc2Zlcl9vZmZlcgAAAAAAAAEAAAAAAAAAB3VuaXRfaWQAAAAD7gAAACAAAAABAAAD6QAAAAIAAAfQAAAADVJlZ2lzdHJ5RXJyb3IAAAA=",
         "AAAAAAAAAExDcmVhdGVzIGEgb25lLXRpbWUgcmVzYWxlIHRyYW5zZmVyIG9mZmVyIGF1dGhlbnRpY2F0ZWQgYnkgdGhlIGN1cnJlbnQgb3duZXIuAAAAFWNyZWF0ZV90cmFuc2Zlcl9vZmZlcgAAAAAAAAMAAAAAAAAAB3VuaXRfaWQAAAAD7gAAACAAAAAAAAAACWNvZGVfaGFzaAAAAAAAA+4AAAAgAAAAAAAAAApleHBpcmVzX2F0AAAAAAAGAAAAAQAAA+kAAAACAAAH0AAAAA1SZWdpc3RyeUVycm9yAAAA",
+        "AAAAAAAAAAAAAAAVZ2V0X2JhdGNoX3JlY2FsbF9pbmZvAAAAAAAAAgAAAAAAAAAFYnJhbmQAAAAAAAATAAAAAAAAAAhiYXRjaF9pZAAAA+4AAAAgAAAAAQAAA+gAAAfQAAAAClJlY2FsbEluZm8AAA==",
         "AAAAAAAAADVSZXZva2VzIGEgc2VydmljZSBjZW50ZXIncyBhdXRob3JpemF0aW9uIGZvciBhIGJyYW5kLgAAAAAAABVyZXZva2Vfc2VydmljZV9jZW50ZXIAAAAAAAACAAAAAAAAAAVicmFuZAAAAAAAABMAAAAAAAAADnNlcnZpY2VfY2VudGVyAAAAAAATAAAAAQAAA+kAAAACAAAH0AAAAA1SZWdpc3RyeUVycm9yAAAA",
         "AAAAAAAAAFJDb25maWd1cmVzIGluaXRpYWwgdGhyZXNob2xkIGdvdmVybmFuY2U7IGxhdGVyIGNoYW5nZXMgcmVxdWlyZSBhbiBhcHByb3ZlZCBhY3Rpb24uAAAAAAAWY29uZmlndXJlX2JyYW5kX2FkbWlucwAAAAAAAgAAAAAAAAAFYnJhbmQAAAAAAAATAAAAAAAAAAZjb25maWcAAAAAB9AAAAAQQnJhbmRBZG1pbkNvbmZpZwAAAAEAAAPpAAAAAgAAB9AAAAANUmVnaXN0cnlFcnJvcgAAAA==",
         "AAAAAAAAAEVSZXR1cm5zIHRoZSBpbW11dGFibGUgb3B0aW9uYWwgZG9jdW1lbnQgZGlnZXN0IGZvciBhIGNvbW1pdHRlZCBiYXRjaC4AAAAAAAAWZ2V0X2JhdGNoX21ldGFkYXRhX2NpZAAAAAAAAgAAAAAAAAAFYnJhbmQAAAAAAAATAAAAAAAAAAhiYXRjaF9pZAAAA+4AAAAgAAAAAQAAA+gAAAPuAAAAIA==",
@@ -600,7 +617,7 @@ export class Client extends ContractClient {
         "AAAABQAAAAAAAAAAAAAAE0JyYW5kQWN0aW9uRXhlY3V0ZWQAAAAAAQAAABVicmFuZF9hY3Rpb25fZXhlY3V0ZWQAAAAAAAAEAAAAAAAAAAVicmFuZAAAAAAAABMAAAABAAAAAAAAAAtwcm9wb3NhbF9pZAAAAAAEAAAAAQAAAAAAAAAGYWN0aW9uAAAAAAfQAAAAC0JyYW5kQWN0aW9uAAAAAAAAAAAAAAAACWFwcHJvdmFscwAAAAAAA+oAAAATAAAAAAAAAAI=",
         "AAAABQAAAAAAAAAAAAAAE0JyYW5kQWN0aW9uUHJvcG9zZWQAAAAAAQAAABVicmFuZF9hY3Rpb25fcHJvcG9zZWQAAAAAAAAEAAAAAAAAAAVicmFuZAAAAAAAABMAAAABAAAAAAAAAAtwcm9wb3NhbF9pZAAAAAAEAAAAAQAAAAAAAAAGY2FsbGVyAAAAAAATAAAAAAAAAAAAAAAGYWN0aW9uAAAAAAfQAAAAC0JyYW5kQWN0aW9uAAAAAAAAAAAC",
         "AAAABQAAAAAAAAAAAAAAF1NlcnZpY2VDZW50ZXJSZWdpc3RlcmVkAAAAAAEAAAAZc2VydmljZV9jZW50ZXJfcmVnaXN0ZXJlZAAAAAAAAAMAAAAAAAAABWJyYW5kAAAAAAAAEwAAAAEAAAAAAAAADnNlcnZpY2VfY2VudGVyAAAAAAATAAAAAQAAAAAAAAAKYXV0aG9yaXplZAAAAAAAAQAAAAAAAAAC",
-        "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAACQAAAAAAAAAAAAAABkNvbmZpZwAAAAAAAQAAAAAAAAAFQnJhbmQAAAAAAAABAAAAEwAAAAEAAAAAAAAAC0JyYW5kQWN0aW9uAAAAAAIAAAATAAAABAAAAAEAAAAAAAAADVNlcnZpY2VDZW50ZXIAAAAAAAACAAAAEwAAABMAAAABAAAAAAAAAAVCYXRjaAAAAAAAAAIAAAATAAAD7gAAACAAAAABAAAAAAAAAARVbml0AAAAAQAAA+4AAAAgAAAAAQAAAAAAAAAOVW5pdFJldGlyZW1lbnQAAAAAAAEAAAPuAAAAIAAAAAEAAAAAAAAABU9mZmVyAAAAAAAAAQAAA+4AAAAgAAAAAQAAAAAAAAAFQ2xhaW0AAAAAAAACAAAD7gAAACAAAAAE",
+        "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAACgAAAAAAAAAAAAAABkNvbmZpZwAAAAAAAQAAAAAAAAAFQnJhbmQAAAAAAAABAAAAEwAAAAEAAAAAAAAAC0JyYW5kQWN0aW9uAAAAAAIAAAATAAAABAAAAAEAAAAAAAAADVNlcnZpY2VDZW50ZXIAAAAAAAACAAAAEwAAABMAAAABAAAAAAAAAAVCYXRjaAAAAAAAAAIAAAATAAAD7gAAACAAAAABAAAAAAAAAA9CYXRjaFJlY2FsbEluZm8AAAAAAgAAABMAAAPuAAAAIAAAAAEAAAAAAAAABFVuaXQAAAABAAAD7gAAACAAAAABAAAAAAAAAA5Vbml0UmV0aXJlbWVudAAAAAAAAQAAA+4AAAAgAAAAAQAAAAAAAAAFT2ZmZXIAAAAAAAABAAAD7gAAACAAAAABAAAAAAAAAAVDbGFpbQAAAAAAAAIAAAPuAAAAIAAAAAQ=",
         "AAAAAQAAAD5TdG9yYWdlIGxheW91dCB1c2VkIGJlZm9yZSBvcHRpb25hbCBleHBpcmF0aW9uIHdhcyBpbnRyb2R1Y2VkLgAAAAAAAAAAAAtMZWdhY3lCYXRjaAAAAAAHAAAAAAAAAAVicmFuZAAAAAAAABMAAAAAAAAACmNyZWF0ZWRfYXQAAAAAAAYAAAAAAAAAC21lcmtsZV9yb290AAAAA+4AAAAgAAAAAAAAABFwcm9kdWN0X21ldGFfaGFzaAAAAAAAA+4AAAAgAAAAAAAAAAhyZWNhbGxlZAAAAAEAAAAAAAAACnVuaXRfY291bnQAAAAAAAYAAAAAAAAAD3dhcnJhbnR5X21vbnRocwAAAAAE",
         "AAAAAQAAAD9TdG9yYWdlIGxheW91dCB1c2VkIGJlZm9yZSB0aHJlc2hvbGQgZ292ZXJuYW5jZSB3YXMgaW50cm9kdWNlZC4AAAAAAAAAAAtMZWdhY3lCcmFuZAAAAAAEAAAAAAAAAAVhZG1pbgAAAAAAABMAAAAAAAAABmRvbWFpbgAAAAAAEAAAAAAAAAANcmVnaXN0ZXJlZF9hdAAAAAAAAAYAAAAAAAAACHZlcmlmaWVkAAAAAQ==" ]),
       options
@@ -642,6 +659,7 @@ export class Client extends ContractClient {
         propose_brand_action: this.txFromJSON<Result<u32>>,
         cancel_transfer_offer: this.txFromJSON<Result<void>>,
         create_transfer_offer: this.txFromJSON<Result<void>>,
+        get_batch_recall_info: this.txFromJSON<Option<RecallInfo>>,
         revoke_service_center: this.txFromJSON<Result<void>>,
         configure_brand_admins: this.txFromJSON<Result<void>>,
         get_batch_metadata_cid: this.txFromJSON<Option<Buffer>>,

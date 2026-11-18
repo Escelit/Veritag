@@ -170,6 +170,9 @@ pub struct BatchRecalled {
     pub brand: Address,
     #[topic]
     pub batch_id: BytesN<32>,
+    pub severity: u32,
+    pub notice_hash: BytesN<32>,
+    /// Mirrors notice_hash for existing indexer consumers.
     pub reason_hash: BytesN<32>,
 }
 

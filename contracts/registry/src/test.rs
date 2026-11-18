@@ -13,8 +13,8 @@ use crate::{
     merkle::{compute_leaf, hash_pair, sha256_bytes, MAX_PROOF_DEPTH},
     storage::DataKey,
     types::{
-        ClaimOutcome, RegistryError, UnitStatus, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
-        SECONDS_PER_MONTH,
+        ClaimOutcome, RecallInfo, RegistryError, UnitStatus, VerifyStatus,
+        DEFAULT_MAX_CLAIMS_PER_UNIT, SECONDS_PER_MONTH,
     },
     VeritagRegistry, VeritagRegistryClient,
 };
@@ -594,7 +594,8 @@ fn test_flag_unit_and_recall_batch_across_entrypoints() {
 
     // Recall entire batch -> affects active unit 1 AND unactivated unit 2
     let recall_reason = f.hash_str("thermal-safety-recall-2026");
-    f.client.recall_batch(&f.brand, &batch_id, &recall_reason);
+    f.client
+        .recall_batch(&f.brand, &batch_id, &1, &recall_reason);
 
     let u1_view = f.client.get_unit(&u1).unwrap();
     assert_eq!(u1_view.status, UnitStatus::Recalled);
@@ -751,7 +752,7 @@ fn test_batch_expiration() {
     );
     let unit_id = f.client.compute_unit_id(&f.brand, &batch_id, &units[2].0);
     assert!(f.client.get_unit(&unit_id).is_none());
-    f.client.recall_batch(&f.brand, &batch_id, &meta);
+    f.client.recall_batch(&f.brand, &batch_id, &1, &meta);
     assert_eq!(
         f.client.get_batch(&f.brand, &batch_id).unwrap().status,
         BatchStatus::Recalled
@@ -846,7 +847,7 @@ fn test_batch_expiration_legacy_storage() {
         &f.alice,
     );
     f.client
-        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
+        .recall_batch(&f.brand, &batch_id, &1, &f.hash_str("RECALL"));
     assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
 }
 
@@ -1043,7 +1044,7 @@ fn test_extend_warranty_missing_and_nonoperational_units() {
     });
     let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
     f.client
-        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
+        .recall_batch(&f.brand, &batch_id, &1, &f.hash_str("RECALL"));
     assert_eq!(
         f.client.try_extend_warranty(&f.brand, &unit_id, &1),
         Err(Ok(RegistryError::BatchRecalled))

@@ -3,8 +3,8 @@ use soroban_sdk::{
 };
 
 use crate::types::{
-    Batch, BatchStatus, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, TransferOffer,
-    Unit, UnitRetirement, SECONDS_PER_MONTH,
+    Batch, BatchStatus, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, RecallInfo,
+    TransferOffer, Unit, UnitRetirement, SECONDS_PER_MONTH,
 };
 
 /// Storage layout used before optional expiration was introduced.
@@ -56,6 +56,7 @@ pub enum DataKey {
     BrandAction(Address, u32),
     ServiceCenter(Address, Address),
     Batch(Address, BytesN<32>),
+    BatchRecallInfo(Address, BytesN<32>),
     Unit(BytesN<32>),
     UnitRetirement(BytesN<32>),
     Offer(BytesN<32>),
@@ -116,6 +117,17 @@ pub fn extend_batch_ttl(env: &Env, key: &DataKey, warranty_months: u32) {
         env.storage()
             .persistent()
             .extend_ttl(key, clamped_threshold, clamped_extend);
+        // Keep recall metadata available for as long as the batch itself.
+        if let DataKey::Batch(brand, batch_id) = key {
+            let recall_key = DataKey::BatchRecallInfo(brand.clone(), batch_id.clone());
+            if env.storage().persistent().has(&recall_key) {
+                env.storage().persistent().extend_ttl(
+                    &recall_key,
+                    clamped_threshold,
+                    clamped_extend,
+                );
+            }
+        }
     }
 }
 
@@ -256,6 +268,30 @@ pub fn set_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>, batch: &Batc
     let key = DataKey::Batch(brand.clone(), batch_id.clone());
     env.storage().persistent().set(&key, batch);
     extend_batch_ttl(env, &key, batch.warranty_months);
+}
+
+// --- Recall metadata ---
+
+pub fn get_batch_recall_info(
+    env: &Env,
+    brand: &Address,
+    batch_id: &BytesN<32>,
+) -> Option<RecallInfo> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BatchRecallInfo(brand.clone(), batch_id.clone()))
+}
+
+pub fn set_batch_recall_info(
+    env: &Env,
+    brand: &Address,
+    batch_id: &BytesN<32>,
+    info: &RecallInfo,
+    warranty_months: u32,
+) {
+    let key = DataKey::BatchRecallInfo(brand.clone(), batch_id.clone());
+    env.storage().persistent().set(&key, info);
+    extend_batch_ttl(env, &key, warranty_months);
 }
 
 // --- Unit ---
