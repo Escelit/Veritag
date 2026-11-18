@@ -848,15 +848,15 @@ fn test_batch_expiration_legacy_storage() {
     assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
 }
 
-fn activate_cooldown_unit(f: &TestFixture<'_>) -> BytesN<32> {
+fn activate_warranty_unit(f: &TestFixture<'_>, warranty_months: u32) -> BytesN<32> {
     f.setup_verified_brand();
-    let batch_id = f.hash_str("BATCH-COOLDOWN");
+    let batch_id = f.hash_str("BATCH-EXTENSION");
     let (root, units) = f.build_sample_batch(1);
     f.client.commit_batch(
         &f.brand,
         &batch_id,
         &root,
-        &12,
+        &warranty_months,
         &f.hash_str("META"),
         &1,
         &None,
@@ -872,108 +872,205 @@ fn activate_cooldown_unit(f: &TestFixture<'_>) -> BytesN<32> {
     )
 }
 
-fn last_transferred_at(f: &TestFixture<'_>, unit_id: &BytesN<32>) -> u64 {
-    f.env.as_contract(&f.contract_id, || {
-        crate::storage::get_unit(&f.env, unit_id)
-            .unwrap()
-            .last_transferred_at
-    })
-}
-
 #[test]
-fn test_transfer_cooldown_rejects_until_exact_boundary() {
-    use crate::types::TRANSFER_COOLDOWN_SECONDS;
+fn test_extend_warranty_active_and_audit_event() {
+    use crate::events::WarrantyExtended;
+    use soroban_sdk::events::Event;
 
     let f = TestFixture::setup();
-    let unit_id = activate_cooldown_unit(&f);
-    let code = Bytes::from_slice(&f.env, b"COOLDOWN-CODE");
-    let hash = sha256_bytes(&f.env, &code);
-    let now = f.env.ledger().timestamp();
-    assert_eq!(last_transferred_at(&f, &unit_id), 0);
-    // Activation does not start a cooldown at current ledger timestamps.
-    f.client
-        .create_transfer_offer(&unit_id, &hash, &(now + 10_000));
-    f.env.ledger().with_mut(|li| li.timestamp += 100);
-    f.client.redeem_transfer(&unit_id, &code, &f.bob);
-    let transferred_at = f.env.ledger().timestamp();
-    assert_eq!(last_transferred_at(&f, &unit_id), transferred_at);
+    let unit_id = activate_warranty_unit(&f, 12);
     let before = f.client.get_unit(&unit_id).unwrap();
-    assert_eq!(before.owner, f.bob);
-
-    for elapsed in [0, 1, TRANSFER_COOLDOWN_SECONDS - 1] {
-        f.env
-            .ledger()
-            .with_mut(|li| li.timestamp = transferred_at + elapsed);
-        assert_eq!(
-            f.client
-                .try_create_transfer_offer(&unit_id, &hash, &(transferred_at + 20_000)),
-            Err(Ok(RegistryError::TransferCooldownActive))
-        );
-        assert!(f.client.get_transfer_offer(&unit_id).is_none());
-        assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
-        assert_eq!(last_transferred_at(&f, &unit_id), transferred_at);
-    }
-
     f.env
         .ledger()
-        .with_mut(|li| li.timestamp = transferred_at + TRANSFER_COOLDOWN_SECONDS);
-    f.client
-        .create_transfer_offer(&unit_id, &hash, &(transferred_at + 20_000));
-    f.client.redeem_transfer(&unit_id, &code, &f.alice);
-    let second_transfer_at = f.env.ledger().timestamp();
-    assert_eq!(last_transferred_at(&f, &unit_id), second_transfer_at);
+        .with_mut(|li| li.timestamp += SECONDS_PER_MONTH);
+
+    let expected_end = before.warranty_expiry + 6 * SECONDS_PER_MONTH;
     assert_eq!(
-        f.client
-            .try_create_transfer_offer(&unit_id, &hash, &(second_transfer_at + 20_000)),
-        Err(Ok(RegistryError::TransferCooldownActive))
+        f.client.extend_warranty(&f.brand, &unit_id, &6),
+        expected_end
+    );
+    assert_eq!(
+        f.env.events().all(),
+        [WarrantyExtended {
+            unit_id: unit_id.clone(),
+            added_months: 6,
+            new_warranty_end: expected_end,
+        }
+        .to_xdr(&f.env, &f.contract_id)]
+    );
+
+    let after = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(after.warranty_expiry, expected_end);
+    assert_eq!(after.activated_at, before.activated_at);
+    assert_eq!(after.owner, before.owner);
+    assert_eq!(after.claims_used, before.claims_used);
+    assert_eq!(after.history_len, before.history_len + 1);
+    assert!(after.warranty_valid);
+    assert!(f.client.is_warranty_valid(&unit_id));
+}
+
+#[test]
+fn test_extend_warranty_expired_uses_previous_expiry() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 12);
+    let old_end = f.client.get_unit(&unit_id).unwrap().warranty_expiry;
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = old_end + 2 * SECONDS_PER_MONTH + 1);
+    assert!(!f.client.is_warranty_valid(&unit_id));
+
+    // A small extension can leave a lapsed warranty expired; it never resets to now.
+    assert_eq!(
+        f.client.extend_warranty(&f.brand, &unit_id, &1),
+        old_end + SECONDS_PER_MONTH
+    );
+    assert!(!f.client.is_warranty_valid(&unit_id));
+    assert_eq!(
+        f.client.extend_warranty(&f.brand, &unit_id, &2),
+        old_end + 3 * SECONDS_PER_MONTH
+    );
+    assert!(f.client.is_warranty_valid(&unit_id));
+    assert_eq!(f.client.file_claim(&unit_id, &f.service_center), 1);
+}
+
+#[test]
+fn test_extend_warranty_cap_and_invalid_months() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 12);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(
+        f.client.try_extend_warranty(&f.brand, &unit_id, &0),
+        Err(Ok(RegistryError::InvalidInput))
+    );
+    assert_eq!(
+        f.client.try_extend_warranty(&f.brand, &unit_id, &u32::MAX),
+        Err(Ok(RegistryError::WarrantyLimitReached))
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+
+    f.client.extend_warranty(&f.brand, &unit_id, &100);
+    let ceiling = before.activated_at + 120 * SECONDS_PER_MONTH;
+    assert_eq!(f.client.extend_warranty(&f.brand, &unit_id, &8), ceiling);
+    let at_cap = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(
+        f.client.try_extend_warranty(&f.brand, &unit_id, &1),
+        Err(Ok(RegistryError::WarrantyLimitReached))
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), at_cap);
+}
+
+#[test]
+fn test_extend_warranty_requires_originating_brand_admin() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 12);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    let other_brand = Address::generate(&f.env);
+    f.client
+        .register_brand(&other_brand, &String::from_str(&f.env, "other.example"));
+    assert_eq!(
+        f.client.try_extend_warranty(&other_brand, &unit_id, &1),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+
+    let rotated_admin = Address::generate(&f.env);
+    f.client.rotate_brand_admin(&f.brand, &rotated_admin);
+    let args: Vec<soroban_sdk::Val> = (f.brand.clone(), unit_id.clone(), 1u32).into_val(&f.env);
+    // Owners, service centers, registry admins and the former brand key cannot authorize.
+    for unauthorized in [&f.alice, &f.service_center, &f.admin, &f.brand] {
+        f.env.mock_auths(&[MockAuth {
+            address: unauthorized,
+            invoke: &MockAuthInvoke {
+                contract: &f.contract_id,
+                fn_name: "extend_warranty",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(f
+            .client
+            .try_extend_warranty(&f.brand, &unit_id, &1)
+            .is_err());
+        assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+    }
+    f.env.mock_auths(&[MockAuth {
+        address: &rotated_admin,
+        invoke: &MockAuthInvoke {
+            contract: &f.contract_id,
+            fn_name: "extend_warranty",
+            args,
+            sub_invokes: &[],
+        },
+    }]);
+    assert_eq!(
+        f.client.extend_warranty(&f.brand, &unit_id, &1),
+        before.warranty_expiry + SECONDS_PER_MONTH
     );
 }
 
 #[test]
-fn test_transfer_cooldown_failed_redemptions_and_cancellations_do_not_start_window() {
+fn test_extend_warranty_missing_and_nonoperational_units() {
     let f = TestFixture::setup();
-    let unit_id = activate_cooldown_unit(&f);
-    let code = Bytes::from_slice(&f.env, b"VALID-CODE");
-    let hash = sha256_bytes(&f.env, &code);
-    let now = f.env.ledger().timestamp();
-    f.client.create_transfer_offer(&unit_id, &hash, &(now + 10));
+    let unit_id = activate_warranty_unit(&f, 12);
     assert_eq!(
         f.client
-            .try_redeem_transfer(&unit_id, &Bytes::from_slice(&f.env, b"WRONG"), &f.bob),
-        Err(Ok(RegistryError::InvalidTransferCode))
+            .try_extend_warranty(&f.brand, &f.hash_str("MISSING"), &1),
+        Err(Ok(RegistryError::UnitNotFound))
     );
-    assert_eq!(last_transferred_at(&f, &unit_id), 0);
-    f.env.ledger().with_mut(|li| li.timestamp = now + 11);
-    assert_eq!(
-        f.client.try_redeem_transfer(&unit_id, &code, &f.bob),
-        Err(Ok(RegistryError::TransferOfferExpired))
-    );
-    assert_eq!(last_transferred_at(&f, &unit_id), 0);
-    f.client.cancel_transfer_offer(&unit_id);
-    assert_eq!(last_transferred_at(&f, &unit_id), 0);
-    f.client
-        .create_transfer_offer(&unit_id, &hash, &(now + 1000));
-    f.client.cancel_transfer_offer(&unit_id);
-    // Offers and cancellations do not impose the completed-transfer cooldown.
-    f.client
-        .create_transfer_offer(&unit_id, &hash, &(now + 1000));
-}
-
-#[test]
-fn test_transfer_cooldown_timestamp_overflow_cannot_bypass_window() {
-    let f = TestFixture::setup();
-    let unit_id = activate_cooldown_unit(&f);
+    for (status, error) in [
+        (UnitStatus::Recalled, RegistryError::BatchRecalled),
+        (UnitStatus::Retired, RegistryError::UnitRetired),
+        (UnitStatus::Flagged, RegistryError::UnitFlagged),
+    ] {
+        f.env.as_contract(&f.contract_id, || {
+            let mut unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
+            unit.status = status;
+            crate::storage::set_unit(&f.env, &unit_id, &unit);
+        });
+        let before = f.client.get_unit(&unit_id).unwrap();
+        assert_eq!(
+            f.client.try_extend_warranty(&f.brand, &unit_id, &1),
+            Err(Ok(error))
+        );
+        assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+    }
+    // A recalled batch also blocks extensions of a unit whose stored status is Active.
     f.env.as_contract(&f.contract_id, || {
         let mut unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
-        unit.last_transferred_at = u64::MAX - 10;
+        unit.status = UnitStatus::Active;
         crate::storage::set_unit(&f.env, &unit_id, &unit);
     });
-    f.env.ledger().with_mut(|li| li.timestamp = u64::MAX - 1);
+    let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
+    f.client
+        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
     assert_eq!(
-        f.client
-            .try_create_transfer_offer(&unit_id, &f.hash_str("CODE"), &u64::MAX),
-        Err(Ok(RegistryError::TransferCooldownActive))
+        f.client.try_extend_warranty(&f.brand, &unit_id, &1),
+        Err(Ok(RegistryError::BatchRecalled))
     );
+}
+
+#[test]
+fn test_extend_warranty_refreshes_unit_ttl() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 1);
+    f.env
+        .ledger()
+        .with_mut(|li| li.sequence_number += 1_200_000);
+    f.client.bump_unit_ttl(&unit_id);
+    f.env.ledger().with_mut(|li| li.sequence_number += 800_000);
+    let old_ttl = f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Unit(unit_id.clone()))
+    });
+    f.client.extend_warranty(&f.brand, &unit_id, &6);
+    let new_ttl = f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Unit(unit_id.clone()))
+    });
+    assert!(new_ttl > old_ttl);
 }
 #[test]
 fn test_merged_batch_metadata_and_expiration_storage() {
@@ -1087,44 +1184,4 @@ fn test_merged_legacy_brand_governance() {
     assert!(!f.client.is_service_center(&f.brand, &f.service_center));
     assert!(f.client.approve_brand_action(&f.alice, &f.brand, &proposal));
     assert!(f.client.is_service_center(&f.brand, &f.service_center));
-}
-
-#[test]
-fn test_transfer_cooldown_legacy_unit_and_retirement() {
-    use crate::types::TRANSFER_COOLDOWN_SECONDS;
-    use soroban_sdk::{Map, Symbol, TryFromVal, Val};
-
-    let f = TestFixture::setup();
-    let unit_id = activate_cooldown_unit(&f);
-    f.env.as_contract(&f.contract_id, || {
-        let unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
-        let value: Val = unit.into_val(&f.env);
-        let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &value).unwrap();
-        fields.remove(Symbol::new(&f.env, "last_transferred_at"));
-        f.env
-            .storage()
-            .persistent()
-            .set(&DataKey::Unit(unit_id.clone()), &fields);
-    });
-    assert_eq!(last_transferred_at(&f, &unit_id), 0);
-    let code = Bytes::from_slice(&f.env, b"LEGACY-COOLDOWN");
-    let code_hash = sha256_bytes(&f.env, &code);
-    let expires_at = f.env.ledger().timestamp() + 10_000;
-    f.client
-        .create_transfer_offer(&unit_id, &code_hash, &expires_at);
-    f.client.redeem_transfer(&unit_id, &code, &f.bob);
-    let transferred_at = f.env.ledger().timestamp();
-    assert_eq!(last_transferred_at(&f, &unit_id), transferred_at);
-    f.client
-        .retire_unit(&f.bob, &unit_id, &1, &f.hash_str("RECYCLING-CERT"));
-    f.env
-        .ledger()
-        .with_mut(|li| li.timestamp += TRANSFER_COOLDOWN_SECONDS);
-    assert_eq!(
-        f.client
-            .try_create_transfer_offer(&unit_id, &code_hash, &expires_at),
-        Err(Ok(RegistryError::UnitRetired)),
-    );
-    assert_eq!(last_transferred_at(&f, &unit_id), transferred_at);
-    assert!(f.client.get_unit_retirement(&unit_id).is_some());
 }
