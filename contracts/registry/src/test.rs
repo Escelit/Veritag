@@ -1,6 +1,7 @@
 extern crate std;
 
 use soroban_sdk::{
+    events::Event,
     testutils::{
         storage::Persistent as _, Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke,
     },
@@ -8,11 +9,12 @@ use soroban_sdk::{
 };
 
 use crate::{
+    events::BatchRecalled,
     merkle::{compute_leaf, hash_pair, sha256_bytes, MAX_PROOF_DEPTH},
     storage::DataKey,
     types::{
-        ClaimOutcome, RegistryError, UnitStatus, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
-        SECONDS_PER_MONTH,
+        ClaimOutcome, RecallInfo, RegistryError, UnitStatus, VerifyStatus,
+        DEFAULT_MAX_CLAIMS_PER_UNIT, SECONDS_PER_MONTH,
     },
     VeritagRegistry, VeritagRegistryClient,
 };
@@ -592,7 +594,8 @@ fn test_flag_unit_and_recall_batch_across_entrypoints() {
 
     // Recall entire batch -> affects active unit 1 AND unactivated unit 2
     let recall_reason = f.hash_str("thermal-safety-recall-2026");
-    f.client.recall_batch(&f.brand, &batch_id, &recall_reason);
+    f.client
+        .recall_batch(&f.brand, &batch_id, &1, &recall_reason);
 
     let u1_view = f.client.get_unit(&u1).unwrap();
     assert_eq!(u1_view.status, UnitStatus::Recalled);
@@ -749,7 +752,7 @@ fn test_batch_expiration() {
     );
     let unit_id = f.client.compute_unit_id(&f.brand, &batch_id, &units[2].0);
     assert!(f.client.get_unit(&unit_id).is_none());
-    f.client.recall_batch(&f.brand, &batch_id, &meta);
+    f.client.recall_batch(&f.brand, &batch_id, &1, &meta);
     assert_eq!(
         f.client.get_batch(&f.brand, &batch_id).unwrap().status,
         BatchStatus::Recalled
@@ -844,7 +847,7 @@ fn test_batch_expiration_legacy_storage() {
         &f.alice,
     );
     f.client
-        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
+        .recall_batch(&f.brand, &batch_id, &1, &f.hash_str("RECALL"));
     assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
 }
 
@@ -1041,7 +1044,7 @@ fn test_extend_warranty_missing_and_nonoperational_units() {
     });
     let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
     f.client
-        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
+        .recall_batch(&f.brand, &batch_id, &1, &f.hash_str("RECALL"));
     assert_eq!(
         f.client.try_extend_warranty(&f.brand, &unit_id, &1),
         Err(Ok(RegistryError::BatchRecalled))
@@ -1184,4 +1187,269 @@ fn test_merged_legacy_brand_governance() {
     assert!(!f.client.is_service_center(&f.brand, &f.service_center));
     assert!(f.client.approve_brand_action(&f.alice, &f.brand, &proposal));
     assert!(f.client.is_service_center(&f.brand, &f.service_center));
+}
+
+#[test]
+fn test_recall_severity_tiers() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    for severity in 1..=3 {
+        let batch_id = f.hash_str(&std::format!("BATCH-RECALL-{severity}"));
+        let notice = f.hash_str(&std::format!("REGULATORY-NOTICE-{severity}"));
+        let (root, units) = f.build_sample_batch(2);
+        f.client
+            .commit_batch(&f.brand, &batch_id, &root, &12, &root, &2, &None, &None);
+        let unit_id = f.client.activate(
+            &f.brand,
+            &batch_id,
+            &units[0].0,
+            &units[0].3,
+            &units[0].1,
+            &f.alice,
+        );
+        assert!(f
+            .client
+            .get_batch_recall_info(&f.brand, &batch_id)
+            .is_none());
+
+        for invalid in [0, 4, 255, u32::MAX] {
+            assert_eq!(
+                f.client
+                    .try_recall_batch(&f.brand, &batch_id, &invalid, &notice),
+                Err(Ok(RegistryError::InvalidInput))
+            );
+            assert!(f.env.events().all().events().is_empty());
+            assert!(!f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
+            assert!(f
+                .client
+                .get_batch_recall_info(&f.brand, &batch_id)
+                .is_none());
+        }
+
+        let recalled_at = f.env.ledger().timestamp();
+        f.client
+            .recall_batch(&f.brand, &batch_id, &severity, &notice);
+        assert_eq!(
+            f.env.events().all(),
+            [BatchRecalled {
+                brand: f.brand.clone(),
+                batch_id: batch_id.clone(),
+                severity,
+                notice_hash: notice.clone(),
+                reason_hash: notice.clone(),
+            }
+            .to_xdr(&f.env, &f.contract_id)]
+        );
+        let expected = RecallInfo {
+            severity,
+            notice_hash: notice,
+            recalled_at,
+        };
+        assert_eq!(
+            f.client.get_batch_recall_info(&f.brand, &batch_id),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            f.env.as_contract(&f.contract_id, || {
+                f.env
+                    .storage()
+                    .persistent()
+                    .get::<_, RecallInfo>(&DataKey::BatchRecallInfo(
+                        f.brand.clone(),
+                        batch_id.clone(),
+                    ))
+            }),
+            Some(expected)
+        );
+        assert!(f.client.get_batch_recall_info(&f.bob, &batch_id).is_none());
+        assert_eq!(
+            f.client.get_unit(&unit_id).unwrap().status,
+            UnitStatus::Recalled
+        );
+        assert_eq!(
+            f.client.try_file_claim(&unit_id, &f.service_center),
+            Err(Ok(RegistryError::BatchRecalled))
+        );
+        assert_eq!(
+            f.client.try_activate(
+                &f.brand,
+                &batch_id,
+                &units[1].0,
+                &units[1].3,
+                &units[1].1,
+                &f.alice,
+            ),
+            Err(Ok(RegistryError::BatchRecalled))
+        );
+    }
+}
+
+#[test]
+fn test_recall_requires_current_brand_admin() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("BATCH-RECALL-AUTH");
+    let notice = f.hash_str("NOTICE");
+    f.client
+        .commit_batch(&f.brand, &batch_id, &notice, &12, &notice, &1, &None, &None);
+    f.client.rotate_brand_admin(&f.brand, &f.bob);
+    for signer in [&f.alice, &f.brand] {
+        f.env.mock_auths(&[MockAuth {
+            address: signer,
+            invoke: &MockAuthInvoke {
+                contract: &f.contract_id,
+                fn_name: "recall_batch",
+                args: (f.brand.clone(), batch_id.clone(), 1u32, notice.clone()).into_val(&f.env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(f
+            .client
+            .try_recall_batch(&f.brand, &batch_id, &1, &notice)
+            .is_err());
+        assert!(!f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
+        assert!(f
+            .client
+            .get_batch_recall_info(&f.brand, &batch_id)
+            .is_none());
+    }
+    f.env.mock_auths(&[MockAuth {
+        address: &f.bob,
+        invoke: &MockAuthInvoke {
+            contract: &f.contract_id,
+            fn_name: "recall_batch",
+            args: (f.brand.clone(), batch_id.clone(), 1u32, notice.clone()).into_val(&f.env),
+            sub_invokes: &[],
+        },
+    }]);
+    f.client.recall_batch(&f.brand, &batch_id, &1, &notice);
+    assert!(f
+        .client
+        .get_batch_recall_info(&f.brand, &batch_id)
+        .is_some());
+}
+
+#[test]
+fn test_recall_metadata_ttl_follows_batch() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("BATCH-RECALL-TTL");
+    let notice = f.hash_str("NOTICE");
+    f.client
+        .commit_batch(&f.brand, &batch_id, &notice, &0, &notice, &1, &None, &None);
+    f.client.recall_batch(&f.brand, &batch_id, &2, &notice);
+    let keys = (
+        DataKey::Batch(f.brand.clone(), batch_id.clone()),
+        DataKey::BatchRecallInfo(f.brand.clone(), batch_id.clone()),
+    );
+    let ttl_before = f.env.as_contract(&f.contract_id, || {
+        assert_eq!(
+            f.env.storage().persistent().get_ttl(&keys.0),
+            f.env.storage().persistent().get_ttl(&keys.1)
+        );
+        f.env.storage().persistent().get_ttl(&keys.0)
+    });
+    f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .instance()
+            .extend_ttl(ttl_before, ttl_before);
+    });
+    f.env
+        .ledger()
+        .with_mut(|li| li.sequence_number += ttl_before / 2 + 1);
+    f.client.bump_batch_ttl(&f.brand, &batch_id);
+    f.env.as_contract(&f.contract_id, || {
+        assert_eq!(f.env.storage().persistent().get_ttl(&keys.0), ttl_before);
+        assert_eq!(f.env.storage().persistent().get_ttl(&keys.1), ttl_before);
+    });
+    assert!(f
+        .client
+        .get_batch_recall_info(&f.brand, &batch_id)
+        .is_some());
+    assert_eq!(
+        f.client
+            .try_recall_batch(&f.brand, &f.hash_str("MISSING"), &1, &notice),
+        Err(Ok(RegistryError::BatchNotFound))
+    );
+    assert_eq!(
+        f.client.try_recall_batch(&f.alice, &batch_id, &1, &notice),
+        Err(Ok(RegistryError::BrandNotFound))
+    );
+}
+
+#[test]
+fn test_recall_metadata_requires_multisig_approval() {
+    use crate::types::{BrandAction, BrandAdminConfig};
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("MULTISIG-RECALL");
+    let notice = f.hash_str("NOTICE");
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &notice,
+        &12,
+        &notice,
+        &1,
+        &None,
+        &Some(notice.clone()),
+    );
+    f.client.configure_brand_admins(
+        &f.brand,
+        &BrandAdminConfig {
+            admins: Vec::from_array(&f.env, [f.brand.clone(), f.bob.clone()]),
+            threshold: 2,
+        },
+    );
+    assert_eq!(
+        f.client.try_recall_batch(&f.brand, &batch_id, &2, &notice),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    let action = BrandAction::RecallBatch(batch_id.clone(), 2, notice.clone());
+    for severity in [0, 4, u32::MAX] {
+        assert_eq!(
+            f.client.try_propose_brand_action(
+                &f.brand,
+                &f.brand,
+                &BrandAction::RecallBatch(batch_id.clone(), severity, notice.clone())
+            ),
+            Err(Ok(RegistryError::InvalidInput))
+        );
+    }
+    let proposal = f.client.propose_brand_action(&f.brand, &f.brand, &action);
+    assert!(!f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
+    assert!(f
+        .client
+        .get_batch_recall_info(&f.brand, &batch_id)
+        .is_none());
+    assert_eq!(
+        f.client
+            .try_approve_brand_action(&f.alice, &f.brand, &proposal),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    f.env.ledger().with_mut(|li| li.timestamp += 10);
+    let recalled_at = f.env.ledger().timestamp();
+    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &proposal));
+    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
+    assert_eq!(
+        f.client
+            .get_batch(&f.brand, &batch_id)
+            .unwrap()
+            .metadata_cid,
+        Some(notice.clone())
+    );
+    assert_eq!(
+        f.client.get_batch_recall_info(&f.brand, &batch_id),
+        Some(RecallInfo {
+            severity: 2,
+            notice_hash: notice,
+            recalled_at
+        })
+    );
+    assert_eq!(
+        f.client
+            .try_approve_brand_action(&f.brand, &f.brand, &proposal),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
 }

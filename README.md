@@ -297,11 +297,12 @@ resolve_claim(unit_id, claim_id, outcome, report_hash) // service center auth
 
 // Safety and recalls
 flag_unit(unit_id, reason_hash)                        // brand auth
-recall_batch(brand, batch_id, reason_hash)             // brand auth
+recall_batch(brand, batch_id, severity, notice_hash)    // brand auth, severity 1..=3
 
 // Reads
 get_brand(brand)
 get_batch(brand, batch_id)
+get_batch_recall_info(brand, batch_id) -> Option<RecallInfo>
 get_unit(unit_id) -> Option<UnitView>
 verify_serial(brand, batch_id, serial_hash, proof, secret_hash) -> VerifyResult
 is_warranty_valid(unit_id) -> bool
@@ -323,7 +324,7 @@ Every state change emits an event so the indexer can rebuild history:
 | `claim_filed` | unit_id | claim_id, service_center |
 | `claim_resolved` | unit_id | claim_id, outcome |
 | `unit_flagged` | unit_id | reason_hash |
-| `batch_recalled` | brand, batch_id | reason_hash |
+| `batch_recalled` | brand, batch_id | severity, notice_hash, reason_hash (same digest for existing consumers) |
 
 ### Error codes
 

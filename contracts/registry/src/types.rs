@@ -70,7 +70,7 @@ pub struct BrandAdminConfig {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrandAction {
-    RecallBatch(BytesN<32>, BytesN<32>),
+    RecallBatch(BytesN<32>, u32, BytesN<32>),
     RegisterServiceCenter(Address),
     RevokeServiceCenter(Address),
     ConfigureAdmins(BrandAdminConfig),
@@ -107,6 +107,16 @@ pub enum BatchStatus {
     Active,
     Expired,
     Recalled,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecallInfo {
+    /// 1: critical/life safety; 2: functional defect; 3: cosmetic/labeling.
+    /// Soroban represents small unsigned integers as u32 in its contract ABI.
+    pub severity: u32,
+    pub notice_hash: BytesN<32>,
+    pub recalled_at: u64,
 }
 
 #[contracttype]

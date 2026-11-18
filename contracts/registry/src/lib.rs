@@ -15,9 +15,9 @@ use crate::events::{
 };
 use crate::types::{
     Batch, BatchStatus, Brand, BrandAction, BrandActionProposal, BrandAdminConfig, Claim,
-    ClaimOutcome, Config, RegistryError, TransferOffer, Unit, UnitRetirement, UnitStatus, UnitView,
-    VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT, MAX_WARRANTY_MONTHS,
-    SECONDS_PER_MONTH,
+    ClaimOutcome, Config, RecallInfo, RegistryError, TransferOffer, Unit, UnitRetirement,
+    UnitStatus, UnitView, VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
+    MAX_WARRANTY_MONTHS, SECONDS_PER_MONTH,
 };
 
 const MAX_DOMAIN_LEN: u32 = 253;
@@ -745,35 +745,51 @@ impl VeritagRegistry {
         Ok(())
     }
 
-    /// Recalls an entire production batch immediately (brand admin only).
+    /// Recalls a batch with a severity tier (1..=3) and regulatory notice digest (brand admin only).
     pub fn recall_batch(
         env: Env,
         brand: Address,
         batch_id: BytesN<32>,
-        reason_hash: BytesN<32>,
+        severity: u32,
+        notice_hash: BytesN<32>,
     ) -> Result<(), RegistryError> {
+        if !(1..=3).contains(&severity) {
+            return Err(RegistryError::InvalidInput);
+        }
         let brand_record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
         Self::require_single_brand_admin(&brand_record)?;
 
-        Self::recall_batch_internal(&env, brand, batch_id, reason_hash)
+        Self::recall_batch_internal(&env, brand, batch_id, severity, notice_hash)
     }
 
     fn recall_batch_internal(
         env: &Env,
         brand: Address,
         batch_id: BytesN<32>,
-        reason_hash: BytesN<32>,
+        severity: u32,
+        notice_hash: BytesN<32>,
     ) -> Result<(), RegistryError> {
+        if !(1..=3).contains(&severity) {
+            return Err(RegistryError::InvalidInput);
+        }
         let mut batch =
             storage::get_batch(env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         batch.recalled = true;
         batch.status = BatchStatus::Recalled;
+        let info = RecallInfo {
+            severity,
+            notice_hash: notice_hash.clone(),
+            recalled_at: env.ledger().timestamp(),
+        };
+        storage::set_batch_recall_info(env, &brand, &batch_id, &info, batch.warranty_months);
         storage::set_batch(env, &brand, &batch_id, &batch);
 
         BatchRecalled {
             brand,
             batch_id,
-            reason_hash,
+            severity,
+            reason_hash: notice_hash.clone(),
+            notice_hash,
         }
         .publish(env);
         Ok(())
@@ -839,6 +855,14 @@ impl VeritagRegistry {
         batch_id: BytesN<32>,
     ) -> Option<BytesN<32>> {
         storage::get_batch(&env, &brand, &batch_id).and_then(|batch| batch.metadata_cid)
+    }
+
+    pub fn get_batch_recall_info(
+        env: Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+    ) -> Option<RecallInfo> {
+        storage::get_batch_recall_info(&env, &brand, &batch_id)
     }
 
     pub fn get_unit(env: Env, unit_id: BytesN<32>) -> Option<UnitView> {
@@ -1100,7 +1124,10 @@ impl VeritagRegistry {
         action: &BrandAction,
     ) -> Result<(), RegistryError> {
         match action {
-            BrandAction::RecallBatch(batch_id, _) => {
+            BrandAction::RecallBatch(batch_id, severity, _) => {
+                if !(1..=3).contains(severity) {
+                    return Err(RegistryError::InvalidInput);
+                }
                 storage::get_batch(env, brand, batch_id).ok_or(RegistryError::BatchNotFound)?;
             }
             BrandAction::RegisterServiceCenter(_) if !record.verified => {
@@ -1123,12 +1150,15 @@ impl VeritagRegistry {
             return Err(RegistryError::NotAuthorized);
         }
         match &proposal.action {
-            BrandAction::RecallBatch(batch_id, reason_hash) => Self::recall_batch_internal(
-                env,
-                brand.clone(),
-                batch_id.clone(),
-                reason_hash.clone(),
-            )?,
+            BrandAction::RecallBatch(batch_id, severity, notice_hash) => {
+                Self::recall_batch_internal(
+                    env,
+                    brand.clone(),
+                    batch_id.clone(),
+                    *severity,
+                    notice_hash.clone(),
+                )?
+            }
             BrandAction::RegisterServiceCenter(center)
             | BrandAction::RevokeServiceCenter(center) => {
                 let authorized = matches!(proposal.action, BrandAction::RegisterServiceCenter(_));
