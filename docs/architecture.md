@@ -23,6 +23,7 @@ flowchart TD
 1. **`contracts/registry` (`VeritagRegistry`):**
    - Single multi-tenant authenticity and warranty registry serving all verified brands.
    - Uses **Instance** storage for `Config`, **Persistent** storage for `Brand`, `ServiceCenter`, `Batch`, `Unit`, and `Claim` (with TTLs automatically extended to cover the remaining warranty + 90-day buffer), and **Temporary** storage for expiring `TransferOffer` codes.
+   - Batch commits may include `metadata_cid: Option<BytesN<32>>`, an immutable content digest for off-chain specifications or certificates. The `BatchCommitted` event includes the digest, and `get_batch_metadata_cid(brand, batch_id)` returns it using the existing 32-byte batch identifier. An absent digest or missing batch returns `None`; legacy stored batches continue to work without metadata. This digest is independent of the existing required `product_meta_hash`.
 2. **`contracts/passkey-account` (`PasskeyAccountContract`):**
    - Implements Soroban `CustomAccountInterface` (`__check_auth`) verifying WebAuthn `authenticatorData` (User Present bit), base64url challenge binding in `clientDataJSON`, and `secp256r1_verify` (P-256) hardware signatures, plus optional `Recovery` signer fallback and passkey rotation (`add_passkey`, `remove_passkey`).
 3. **`contracts/account-factory` (`AccountFactoryContract`):**

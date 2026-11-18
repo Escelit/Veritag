@@ -620,6 +620,7 @@ export function createV1Router(deps: ApiDependencies): Hono<{ Variables: AppVari
               warranty_months: built.batch.warrantyMonths,
               product_meta_hash: built.batch.productMetaHash,
               unit_count: built.batch.unitCount,
+              metadata_cid: null,
             },
           },
         },

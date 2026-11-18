@@ -197,7 +197,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     let meta = f.hash_str("META");
     assert_eq!(
         f.client
-            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100),
+            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None),
         Err(Ok(RegistryError::BrandNotVerified))
     );
     assert_eq!(
@@ -216,7 +216,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     assert_eq!(f.client.get_brand(&f.brand).unwrap().admin, rotated_signer);
 
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100);
+        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None);
     assert!(f.client.get_batch(&f.brand, &batch_id).is_some());
 }
 
@@ -231,18 +231,39 @@ fn test_merkle_batch_commit_and_lazy_activation() {
 
     // Zero unit count rejected
     assert_eq!(
-        f.client
-            .try_commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &0),
+        f.client.try_commit_batch(
+            &f.brand,
+            &batch_id,
+            &merkle_root,
+            &12,
+            &meta_hash,
+            &0,
+            &None
+        ),
         Err(Ok(RegistryError::InvalidInput))
     );
 
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &5);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &12,
+        &meta_hash,
+        &5,
+        &None,
+    );
 
     // Duplicate batch rejected
     assert_eq!(
-        f.client
-            .try_commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &5),
+        f.client.try_commit_batch(
+            &f.brand,
+            &batch_id,
+            &merkle_root,
+            &12,
+            &meta_hash,
+            &5,
+            &None
+        ),
         Err(Ok(RegistryError::BatchExists))
     );
 
@@ -344,8 +365,15 @@ fn test_resale_transfer_offer_redeem_expiry_and_cancel() {
     let batch_id = f.hash_str("BATCH-RESALE");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(2);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &24, &meta_hash, &2);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &24,
+        &meta_hash,
+        &2,
+        &None,
+    );
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
     let unit_id = f
@@ -422,7 +450,7 @@ fn test_warranty_boundary_and_claims_workflow() {
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(2);
     f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &6, &meta_hash, &2);
+        .commit_batch(&f.brand, &batch_id, &merkle_root, &6, &meta_hash, &2, &None);
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
     let unit_id = f
@@ -501,8 +529,15 @@ fn test_flag_unit_and_recall_batch_across_entrypoints() {
     let batch_id = f.hash_str("BATCH-SAFETY");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(3);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &3);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &12,
+        &meta_hash,
+        &3,
+        &None,
+    );
 
     // Activate unit 0 and unit 1; leave unit 2 unactivated
     let u0 = f.client.activate(
@@ -577,8 +612,15 @@ fn test_ttl_extension_and_strict_authorization() {
     let batch_id = f.hash_str("BATCH-TTL");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(1);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &24, &meta_hash, &1);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &24,
+        &meta_hash,
+        &1,
+        &None,
+    );
 
     let unit_id = f.client.activate(
         &f.brand,
@@ -633,4 +675,125 @@ fn test_ttl_extension_and_strict_authorization() {
         .client
         .try_create_transfer_offer(&unit_id, &code_hash, &expires_at)
         .is_ok());
+}
+
+#[test]
+fn test_batch_metadata_cid() {
+    use crate::events::BatchCommitted;
+    use soroban_sdk::events::Event;
+    for with_metadata in [true, false] {
+        let f = TestFixture::setup();
+        f.setup_verified_brand();
+        let batch_id = f.hash_str("METADATA");
+        let meta = f.hash_str("PRODUCT");
+        let metadata_cid = with_metadata.then(|| f.hash_str("COMPLIANCE-CERTIFICATE"));
+        let (root, units) = f.build_sample_batch(1);
+        assert_eq!(f.client.get_batch_metadata_cid(&f.brand, &batch_id), None);
+        f.client
+            .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &metadata_cid);
+        let event = BatchCommitted {
+            brand: f.brand.clone(),
+            batch_id: batch_id.clone(),
+            root,
+            warranty_months: 12,
+            unit_count: 1,
+            metadata_cid: metadata_cid.clone(),
+        };
+        assert_eq!(
+            f.env.events().all(),
+            Vec::from_array(
+                &f.env,
+                [(
+                    f.contract_id.clone(),
+                    event.topics(&f.env),
+                    event.data(&f.env)
+                )]
+            )
+        );
+        assert_eq!(
+            f.client.get_batch_metadata_cid(&f.brand, &batch_id),
+            metadata_cid
+        );
+        let batch = f.client.get_batch(&f.brand, &batch_id).unwrap();
+        assert_eq!(batch.metadata_cid, metadata_cid);
+        assert_eq!(batch.product_meta_hash, meta);
+        f.client.activate(
+            &f.brand,
+            &batch_id,
+            &units[0].0,
+            &units[0].3,
+            &units[0].1,
+            &f.alice,
+        );
+    }
+}
+
+#[test]
+fn test_batch_metadata_cid_is_immutable() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("IMMUTABLE");
+    let root = f.hash_str("ROOT");
+    let meta = f.hash_str("META");
+    let cid = Some(f.hash_str("DOCUMENT-V1"));
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &cid);
+    assert_eq!(
+        f.client.try_commit_batch(
+            &f.brand,
+            &batch_id,
+            &root,
+            &12,
+            &meta,
+            &1,
+            &Some(f.hash_str("DOCUMENT-V2"))
+        ),
+        Err(Ok(RegistryError::BatchExists))
+    );
+    assert_eq!(f.client.get_batch_metadata_cid(&f.brand, &batch_id), cid);
+    f.client.recall_batch(&f.brand, &batch_id, &meta);
+    assert_eq!(f.client.get_batch_metadata_cid(&f.brand, &batch_id), cid);
+}
+
+#[test]
+fn test_batch_metadata_cid_legacy_storage() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("LEGACY-METADATA");
+    let meta = f.hash_str("LEGACY-PRODUCT");
+    let (root, units) = f.build_sample_batch(1);
+    let legacy = crate::storage::LegacyBatch {
+        brand: f.brand.clone(),
+        merkle_root: root,
+        warranty_months: 12,
+        product_meta_hash: meta.clone(),
+        unit_count: 1,
+        created_at: f.env.ledger().timestamp(),
+        recalled: false,
+    };
+    f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Batch(f.brand.clone(), batch_id.clone()), &legacy)
+    });
+    assert_eq!(f.client.get_batch_metadata_cid(&f.brand, &batch_id), None);
+    assert_eq!(
+        f.client
+            .get_batch(&f.brand, &batch_id)
+            .unwrap()
+            .product_meta_hash,
+        meta
+    );
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    f.client
+        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
+    assert_eq!(f.client.get_batch_metadata_cid(&f.brand, &batch_id), None);
 }

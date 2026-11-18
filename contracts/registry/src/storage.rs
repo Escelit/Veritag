@@ -1,6 +1,19 @@
-use soroban_sdk::{contracttype, Address, BytesN, Env};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Map, Symbol, TryFromVal, Val};
 
 use crate::types::{Batch, Brand, Claim, Config, TransferOffer, Unit, SECONDS_PER_MONTH};
+
+/// Storage layout used before optional document metadata was introduced.
+#[contracttype]
+#[derive(Clone)]
+pub struct LegacyBatch {
+    pub brand: Address,
+    pub merkle_root: BytesN<32>,
+    pub warranty_months: u32,
+    pub product_meta_hash: BytesN<32>,
+    pub unit_count: u64,
+    pub created_at: u64,
+    pub recalled: bool,
+}
 
 /// Approximate Stellar ledger close interval (~5 seconds per ledger).
 pub const SECONDS_PER_LEDGER: u64 = 5;
@@ -144,9 +157,26 @@ pub fn has_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> bool {
 }
 
 pub fn get_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> Option<Batch> {
-    env.storage()
+    let value: Val = env
+        .storage()
         .persistent()
-        .get(&DataKey::Batch(brand.clone(), batch_id.clone()))
+        .get(&DataKey::Batch(brand.clone(), batch_id.clone()))?;
+    let fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid batch storage");
+    Some(if fields.len() == 7 {
+        let legacy = LegacyBatch::try_from_val(env, &value).expect("invalid batch storage");
+        Batch {
+            brand: legacy.brand,
+            merkle_root: legacy.merkle_root,
+            warranty_months: legacy.warranty_months,
+            product_meta_hash: legacy.product_meta_hash,
+            metadata_cid: None,
+            unit_count: legacy.unit_count,
+            created_at: legacy.created_at,
+            recalled: legacy.recalled,
+        }
+    } else {
+        Batch::try_from_val(env, &value).expect("invalid batch storage")
+    })
 }
 
 pub fn set_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>, batch: &Batch) {
