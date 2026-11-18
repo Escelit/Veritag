@@ -24,6 +24,7 @@ pub enum AccountError {
     RecoveryNotConfigured = 5,
     CannotRemoveLastAuthMethod = 6,
     InvalidPublicKey = 7,
+    NonceExhausted = 8,
 }
 
 #[contracttype]
@@ -49,6 +50,7 @@ pub enum DataKey {
     Passkey(Bytes),
     PasskeyCount,
     RecoverySigner,
+    Nonce,
 }
 
 /// Encodes a 32-byte array into a 43-byte unpadded RFC 4648 base64url string.
@@ -76,37 +78,34 @@ pub fn encode_base64url_32(input: &[u8; 32]) -> [u8; 43] {
 }
 
 fn contains_challenge_field(client_data_json: &Bytes, expected_b64: &[u8; 43]) -> bool {
-    // Pattern: `"challenge":"<43-bytes>"` (total 57 bytes)
     let prefix = b"\"challenge\":\"";
-    let pattern_len = prefix.len() + 43 + 1; // 13 + 43 + 1 = 57
     let json_len = client_data_json.len() as usize;
-    if json_len < pattern_len {
+    if json_len < prefix.len() + expected_b64.len() + 1 {
         return false;
     }
 
-    let mut pattern = [0u8; 57];
-    pattern[..13].copy_from_slice(prefix);
-    pattern[13..56].copy_from_slice(expected_b64);
-    pattern[56] = b'"';
-
-    let max_start = json_len - pattern_len;
-    let mut start = 0usize;
-    while start <= max_start {
-        let mut matched = true;
-        let mut k = 0usize;
-        while k < pattern_len {
-            if client_data_json.get((start + k) as u32) != Some(pattern[k]) {
-                matched = false;
-                break;
-            }
-            k += 1;
+    let mut found = false;
+    let mut matches_expected = false;
+    for start in 0..=json_len - prefix.len() {
+        let matches_prefix = prefix
+            .iter()
+            .enumerate()
+            .all(|(offset, byte)| client_data_json.get((start + offset) as u32) == Some(*byte));
+        if !matches_prefix {
+            continue;
         }
-        if matched {
-            return true;
+        // Multiple challenges could let one assertion bind to several nonces.
+        if found {
+            return false;
         }
-        start += 1;
+        found = true;
+        let value_start = start + prefix.len();
+        matches_expected = expected_b64.iter().enumerate().all(|(offset, byte)| {
+            client_data_json.get((value_start + offset) as u32) == Some(*byte)
+        }) && client_data_json.get((value_start + expected_b64.len()) as u32)
+            == Some(b'"');
     }
-    false
+    found && matches_expected
 }
 
 #[contract]
@@ -127,6 +126,7 @@ impl PasskeyAccountContract {
             .instance()
             .set(&DataKey::Passkey(credential_id), &public_key);
         env.storage().instance().set(&DataKey::PasskeyCount, &1u32);
+        env.storage().instance().set(&DataKey::Nonce, &0u64);
         if let Some(rec) = recovery {
             env.storage().instance().set(&DataKey::RecoverySigner, &rec);
         }
@@ -227,6 +227,12 @@ impl PasskeyAccountContract {
     pub fn get_recovery_signer(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::RecoverySigner)
     }
+
+    /// Returns the next account authorization nonce.
+    /// WebAuthn clients use SHA256(signature_payload || nonce.to_be_bytes()) as the challenge.
+    pub fn get_nonce(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::Nonce).unwrap_or(0)
+    }
 }
 
 #[contractimpl]
@@ -241,6 +247,8 @@ impl CustomAccountInterface for PasskeyAccountContract {
         signature: Self::Signature,
         _auth_contexts: Vec<Context>,
     ) -> Result<(), Self::Error> {
+        let nonce = Self::get_nonce(env.clone());
+        let next_nonce = nonce.checked_add(1).ok_or(AccountError::NonceExhausted)?;
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -253,7 +261,6 @@ impl CustomAccountInterface for PasskeyAccountContract {
                     .get(&DataKey::RecoverySigner)
                     .ok_or(AccountError::RecoveryNotConfigured)?;
                 recovery.require_auth();
-                Ok(())
             }
             AccountSignature::WebAuthn(cred) => {
                 let public_key: BytesN<65> = env
@@ -276,9 +283,12 @@ impl CustomAccountInterface for PasskeyAccountContract {
                     return Err(AccountError::UserNotPresent);
                 }
 
-                // Verify the base64url-encoded 32-byte signature_payload appears in clientDataJSON
-                let payload_arr = signature_payload.to_array();
-                let expected_b64 = encode_base64url_32(&payload_arr);
+                // Bind the challenge to the current sequential account nonce.
+                // The nonce is an unsigned 64 bit integer in big endian byte order.
+                let mut challenge_payload = Bytes::from_array(&env, &signature_payload.to_array());
+                challenge_payload.extend_from_array(&nonce.to_be_bytes());
+                let challenge_digest = env.crypto().sha256(&challenge_payload);
+                let expected_b64 = encode_base64url_32(&challenge_digest.to_array());
                 if !contains_challenge_field(&cred.client_data_json, &expected_b64) {
                     return Err(AccountError::ChallengeMismatch);
                 }
@@ -292,10 +302,12 @@ impl CustomAccountInterface for PasskeyAccountContract {
                 // Host trap panics on invalid signature
                 env.crypto()
                     .secp256r1_verify(&public_key, &message_digest, &cred.signature);
-
-                Ok(())
             }
         }
+
+        // Consume the nonce only after the passkey signature or recovery authorization succeeds.
+        env.storage().instance().set(&DataKey::Nonce, &next_nonce);
+        Ok(())
     }
 }
 
