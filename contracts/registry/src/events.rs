@@ -75,6 +75,15 @@ pub struct UnitActivated {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WarrantyExtended {
+    #[topic]
+    pub unit_id: BytesN<32>,
+    pub added_months: u32,
+    pub new_warranty_end: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DuplicateAttempt {
     #[topic]
     pub unit_id: BytesN<32>,
