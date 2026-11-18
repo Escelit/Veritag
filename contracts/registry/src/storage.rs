@@ -232,10 +232,6 @@ pub fn get_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> Option<Ba
     if !fields.contains_key(status_key.clone()) {
         fields.set(status_key, BatchStatus::Active.into_val(env));
     }
-    let limit_key = Symbol::new(env, "max_transfers");
-    if !fields.contains_key(limit_key.clone()) {
-        fields.set(limit_key, None::<u32>.into_val(env));
-    }
     let normalized: Val = fields.into_val(env);
     let mut batch = Batch::try_from_val(env, &normalized).expect("invalid batch storage");
     // Time advances without a transaction. Derive the effective status on every read.
@@ -272,9 +268,9 @@ pub fn get_unit(env: &Env, unit_id: &BytesN<32>) -> Option<Unit> {
         .persistent()
         .get(&DataKey::Unit(unit_id.clone()))?;
     let mut fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid unit storage");
-    let count_key = Symbol::new(env, "transfer_count");
-    if !fields.contains_key(count_key.clone()) {
-        fields.set(count_key, 0u32.into_val(env));
+    let timestamp_key = Symbol::new(env, "last_transferred_at");
+    if !fields.contains_key(timestamp_key.clone()) {
+        fields.set(timestamp_key, 0u64.into_val(env));
     }
     let normalized: Val = fields.into_val(env);
     Some(Unit::try_from_val(env, &normalized).expect("invalid unit storage"))

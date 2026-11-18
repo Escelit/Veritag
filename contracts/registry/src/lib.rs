@@ -8,15 +8,16 @@ pub mod types;
 use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
 use crate::events::{
-    BatchCommitted, BatchRecalled, BatchTransferLimitUpdated, BrandActionExecuted,
-    BrandActionProposed, BrandRegistered, BrandVerified, ClaimFiled, ClaimResolved,
-    DuplicateAttempt, ServiceCenterRegistered, TransferCancelled, TransferOffered, UnitActivated,
-    UnitFlagged, UnitRetired, UnitTransferred,
+    BatchCommitted, BatchRecalled, BrandActionExecuted, BrandActionProposed, BrandRegistered,
+    BrandVerified, ClaimFiled, ClaimResolved, DuplicateAttempt, ServiceCenterRegistered,
+    TransferCancelled, TransferOffered, UnitActivated, UnitFlagged, UnitRetired, UnitTransferred,
+    WarrantyExtended,
 };
 use crate::types::{
     Batch, BatchStatus, Brand, BrandAction, BrandActionProposal, BrandAdminConfig, Claim,
     ClaimOutcome, Config, RegistryError, TransferOffer, Unit, UnitRetirement, UnitStatus, UnitView,
-    VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT, SECONDS_PER_MONTH,
+    VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT, MAX_WARRANTY_MONTHS,
+    SECONDS_PER_MONTH,
 };
 
 const MAX_DOMAIN_LEN: u32 = 253;
@@ -402,6 +403,7 @@ impl VeritagRegistry {
             status: UnitStatus::Active,
             transfer_count: 0,
             activated_at: now,
+            last_transferred_at: 0,
             warranty_expiry,
             claims_used: 0,
             history_len: 1,
@@ -515,6 +517,11 @@ impl VeritagRegistry {
         Self::ensure_transfer_limit(&env, &unit)?;
 
         let now = env.ledger().timestamp();
+        // Subtract rather than adding to last_transferred_at so the cooldown
+        // cannot wrap near u64::MAX or be bypassed by an earlier timestamp.
+        if now.saturating_sub(unit.last_transferred_at) < TRANSFER_COOLDOWN_SECONDS {
+            return Err(RegistryError::TransferCooldownActive);
+        }
         if expires_at <= now {
             return Err(RegistryError::InvalidInput);
         }
@@ -565,10 +572,7 @@ impl VeritagRegistry {
 
         let previous_owner = unit.owner.clone();
         unit.owner = new_owner.clone();
-        unit.transfer_count = unit
-            .transfer_count
-            .checked_add(1)
-            .ok_or(RegistryError::TransferLimitReached)?;
+        unit.last_transferred_at = env.ledger().timestamp();
         unit.history_len = unit.history_len.saturating_add(1);
 
         storage::remove_offer(&env, &unit_id);
@@ -603,8 +607,52 @@ impl VeritagRegistry {
     }
 
     // -------------------------------------------------------------------------
-    // Warranty Claims
+    // Warranty Extensions & Claims
     // -------------------------------------------------------------------------
+
+    /// Adds months to the existing expiry, including for a lapsed warranty (brand admin only).
+    /// Total coverage cannot exceed 120 months from activation.
+    pub fn extend_warranty(
+        env: Env,
+        brand: Address,
+        unit_id: BytesN<32>,
+        additional_months: u32,
+    ) -> Result<u64, RegistryError> {
+        if additional_months == 0 {
+            return Err(RegistryError::InvalidInput);
+        }
+        let mut unit = storage::get_unit(&env, &unit_id).ok_or(RegistryError::UnitNotFound)?;
+        if unit.brand != brand {
+            return Err(RegistryError::NotAuthorized);
+        }
+        let brand_record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        brand_record.admin.require_auth();
+        Self::ensure_unit_operational(&env, &unit)?;
+
+        let ceiling = unit
+            .activated_at
+            .checked_add(u64::from(MAX_WARRANTY_MONTHS) * SECONDS_PER_MONTH)
+            .ok_or(RegistryError::InvalidInput)?;
+        let new_warranty_end = unit
+            .warranty_expiry
+            .checked_add(u64::from(additional_months) * SECONDS_PER_MONTH)
+            .ok_or(RegistryError::WarrantyLimitReached)?;
+        if new_warranty_end > ceiling {
+            return Err(RegistryError::WarrantyLimitReached);
+        }
+
+        unit.warranty_expiry = new_warranty_end;
+        unit.history_len = unit.history_len.saturating_add(1);
+        storage::set_unit(&env, &unit_id, &unit);
+        storage::extend_instance_ttl(&env);
+        WarrantyExtended {
+            unit_id,
+            added_months: additional_months,
+            new_warranty_end,
+        }
+        .publish(&env);
+        Ok(new_warranty_end)
+    }
 
     /// Files a warranty claim with an authorized service center for the unit's brand.
     pub fn file_claim(

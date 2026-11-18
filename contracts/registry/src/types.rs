@@ -7,6 +7,9 @@ pub const DEFAULT_MAX_CLAIMS_PER_UNIT: u32 = 5;
 /// Using 30 days (2,592,000 seconds) for deterministic, transparent on-chain calculation.
 pub const SECONDS_PER_MONTH: u64 = 30 * 24 * 60 * 60;
 
+/// Maximum total warranty duration measured from the unit's activation.
+pub const MAX_WARRANTY_MONTHS: u32 = 120;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -35,7 +38,7 @@ pub enum RegistryError {
     InvalidInput = 22,
     UnitRetired = 23,
     BatchExpired = 24,
-    TransferLimitReached = 27,
+    WarrantyLimitReached = 25,
 }
 
 #[contracttype]
@@ -135,6 +138,7 @@ pub struct Unit {
     pub status: UnitStatus,
     pub transfer_count: u32,
     pub activated_at: u64,
+    pub last_transferred_at: u64,
     pub warranty_expiry: u64,
     pub claims_used: u32,
     pub history_len: u32,

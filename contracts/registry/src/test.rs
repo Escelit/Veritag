@@ -848,15 +848,15 @@ fn test_batch_expiration_legacy_storage() {
     assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
 }
 
-fn activate_transfer_count_unit(f: &TestFixture<'_>) -> BytesN<32> {
+fn activate_warranty_unit(f: &TestFixture<'_>, warranty_months: u32) -> BytesN<32> {
     f.setup_verified_brand();
-    let batch_id = f.hash_str("BATCH-TRANSFER-COUNT");
+    let batch_id = f.hash_str("BATCH-EXTENSION");
     let (root, units) = f.build_sample_batch(1);
     f.client.commit_batch(
         &f.brand,
         &batch_id,
         &root,
-        &12,
+        &warranty_months,
         &f.hash_str("META"),
         &1,
         &None,
@@ -873,235 +873,204 @@ fn activate_transfer_count_unit(f: &TestFixture<'_>) -> BytesN<32> {
 }
 
 #[test]
-fn test_transfer_count_increments_and_is_visible() {
-    use crate::events::UnitTransferred;
+fn test_extend_warranty_active_and_audit_event() {
+    use crate::events::WarrantyExtended;
     use soroban_sdk::events::Event;
 
     let f = TestFixture::setup();
-    let unit_id = activate_transfer_count_unit(&f);
-    let original = f.client.get_unit(&unit_id).unwrap();
-    assert_eq!(original.transfer_count, 0);
-    let batch = f.client.get_batch(&f.brand, &original.batch_id).unwrap();
-    assert_eq!(batch.max_transfers, None);
-    let code = Bytes::from_slice(&f.env, b"COUNT-CODE");
-    let hash = sha256_bytes(&f.env, &code);
-    let expires_at = f.env.ledger().timestamp() + 10_000;
-    let mut previous_owner = f.alice.clone();
+    let unit_id = activate_warranty_unit(&f, 12);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp += SECONDS_PER_MONTH);
 
-    // No cap permits repeated completed transfers; counts are separate from other history.
-    for (index, next_owner) in [&f.bob, &f.alice, &f.bob].into_iter().enumerate() {
-        f.client.create_transfer_offer(&unit_id, &hash, &expires_at);
-        assert_eq!(
-            f.client.get_unit(&unit_id).unwrap().transfer_count,
-            index as u32
-        );
-        f.client.redeem_transfer(&unit_id, &code, next_owner);
-        let count = index as u32 + 1;
-        assert_eq!(
-            f.env.events().all(),
-            [UnitTransferred {
-                unit_id: unit_id.clone(),
-                from: previous_owner,
-                to: next_owner.clone(),
-                transfer_count: count,
-            }
-            .to_xdr(&f.env, &f.contract_id)]
-        );
-        let after = f.client.get_unit(&unit_id).unwrap();
-        assert_eq!(after.transfer_count, count);
-        assert_eq!(after.owner, *next_owner);
-        assert_eq!(after.warranty_expiry, original.warranty_expiry);
-        assert!(f.client.get_transfer_offer(&unit_id).is_none());
-        previous_owner = next_owner.clone();
-    }
+    let expected_end = before.warranty_expiry + 6 * SECONDS_PER_MONTH;
+    assert_eq!(
+        f.client.extend_warranty(&f.brand, &unit_id, &6),
+        expected_end
+    );
+    assert_eq!(
+        f.env.events().all(),
+        [WarrantyExtended {
+            unit_id: unit_id.clone(),
+            added_months: 6,
+            new_warranty_end: expected_end,
+        }
+        .to_xdr(&f.env, &f.contract_id)]
+    );
+
+    let after = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(after.warranty_expiry, expected_end);
+    assert_eq!(after.activated_at, before.activated_at);
+    assert_eq!(after.owner, before.owner);
+    assert_eq!(after.claims_used, before.claims_used);
+    assert_eq!(after.history_len, before.history_len + 1);
+    assert!(after.warranty_valid);
+    assert!(f.client.is_warranty_valid(&unit_id));
 }
 
 #[test]
-fn test_transfer_count_cap_zero_boundary_and_removal() {
+fn test_extend_warranty_expired_uses_previous_expiry() {
     let f = TestFixture::setup();
-    let unit_id = activate_transfer_count_unit(&f);
-    let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
-    let code = Bytes::from_slice(&f.env, b"LIMIT-CODE");
-    let hash = sha256_bytes(&f.env, &code);
-    let expires_at = f.env.ledger().timestamp() + 10_000;
+    let unit_id = activate_warranty_unit(&f, 12);
+    let old_end = f.client.get_unit(&unit_id).unwrap().warranty_expiry;
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = old_end + 2 * SECONDS_PER_MONTH + 1);
+    assert!(!f.client.is_warranty_valid(&unit_id));
 
-    f.client.set_max_transfers(&f.brand, &batch_id, &Some(0));
+    // A small extension can leave a lapsed warranty expired; it never resets to now.
     assert_eq!(
-        f.client
-            .get_batch(&f.brand, &batch_id)
-            .unwrap()
-            .max_transfers,
-        Some(0)
+        f.client.extend_warranty(&f.brand, &unit_id, &1),
+        old_end + SECONDS_PER_MONTH
+    );
+    assert!(!f.client.is_warranty_valid(&unit_id));
+    assert_eq!(
+        f.client.extend_warranty(&f.brand, &unit_id, &2),
+        old_end + 3 * SECONDS_PER_MONTH
+    );
+    assert!(f.client.is_warranty_valid(&unit_id));
+    assert_eq!(f.client.file_claim(&unit_id, &f.service_center), 1);
+}
+
+#[test]
+fn test_extend_warranty_cap_and_invalid_months() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 12);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(
+        f.client.try_extend_warranty(&f.brand, &unit_id, &0),
+        Err(Ok(RegistryError::InvalidInput))
     );
     assert_eq!(
-        f.client
-            .try_create_transfer_offer(&unit_id, &hash, &expires_at),
-        Err(Ok(RegistryError::TransferLimitReached))
+        f.client.try_extend_warranty(&f.brand, &unit_id, &u32::MAX),
+        Err(Ok(RegistryError::WarrantyLimitReached))
     );
-    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 0);
-    f.client.set_max_transfers(&f.brand, &batch_id, &Some(2));
-    for owner in [&f.bob, &f.alice] {
-        f.client.create_transfer_offer(&unit_id, &hash, &expires_at);
-        f.client.redeem_transfer(&unit_id, &code, owner);
-    }
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+
+    f.client.extend_warranty(&f.brand, &unit_id, &100);
+    let ceiling = before.activated_at + 120 * SECONDS_PER_MONTH;
+    assert_eq!(f.client.extend_warranty(&f.brand, &unit_id, &8), ceiling);
     let at_cap = f.client.get_unit(&unit_id).unwrap();
-    assert_eq!(at_cap.transfer_count, 2);
     assert_eq!(
-        f.client
-            .try_create_transfer_offer(&unit_id, &hash, &expires_at),
-        Err(Ok(RegistryError::TransferLimitReached))
+        f.client.try_extend_warranty(&f.brand, &unit_id, &1),
+        Err(Ok(RegistryError::WarrantyLimitReached))
     );
-    assert!(f.client.get_transfer_offer(&unit_id).is_none());
     assert_eq!(f.client.get_unit(&unit_id).unwrap(), at_cap);
-
-    f.client.set_max_transfers(&f.brand, &batch_id, &None);
-    assert_eq!(
-        f.client
-            .get_batch(&f.brand, &batch_id)
-            .unwrap()
-            .max_transfers,
-        None
-    );
-    f.client.create_transfer_offer(&unit_id, &hash, &expires_at);
-    f.client.redeem_transfer(&unit_id, &code, &f.bob);
-    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 3);
 }
 
 #[test]
-fn test_transfer_count_cap_changed_after_offer_blocks_redemption() {
+fn test_extend_warranty_requires_originating_brand_admin() {
     let f = TestFixture::setup();
-    let unit_id = activate_transfer_count_unit(&f);
-    let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
-    let code = Bytes::from_slice(&f.env, b"PENDING-CODE");
-    let hash = sha256_bytes(&f.env, &code);
+    let unit_id = activate_warranty_unit(&f, 12);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    let other_brand = Address::generate(&f.env);
     f.client
-        .create_transfer_offer(&unit_id, &hash, &(f.env.ledger().timestamp() + 1000));
-    let before = f.client.get_unit(&unit_id).unwrap();
-    let offer = f.client.get_transfer_offer(&unit_id);
-    f.client.set_max_transfers(&f.brand, &batch_id, &Some(0));
+        .register_brand(&other_brand, &String::from_str(&f.env, "other.example"));
     assert_eq!(
-        f.client.try_redeem_transfer(&unit_id, &code, &f.bob),
-        Err(Ok(RegistryError::TransferLimitReached))
+        f.client.try_extend_warranty(&other_brand, &unit_id, &1),
+        Err(Ok(RegistryError::NotAuthorized))
     );
-    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
-    assert_eq!(f.client.get_transfer_offer(&unit_id), offer);
-    f.client.cancel_transfer_offer(&unit_id);
-    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 0);
-}
 
-#[test]
-fn test_transfer_count_failed_redemptions_do_not_increment() {
-    let f = TestFixture::setup();
-    let unit_id = activate_transfer_count_unit(&f);
-    let code = Bytes::from_slice(&f.env, b"VALID-CODE");
-    let hash = sha256_bytes(&f.env, &code);
-    let now = f.env.ledger().timestamp();
-    f.client.create_transfer_offer(&unit_id, &hash, &(now + 10));
-    let before = f.client.get_unit(&unit_id).unwrap();
-    assert_eq!(
-        f.client
-            .try_redeem_transfer(&unit_id, &Bytes::from_slice(&f.env, b"WRONG"), &f.bob),
-        Err(Ok(RegistryError::InvalidTransferCode))
-    );
-    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
-    f.env.ledger().with_mut(|li| li.timestamp = now + 11);
-    assert_eq!(
-        f.client.try_redeem_transfer(&unit_id, &code, &f.bob),
-        Err(Ok(RegistryError::TransferOfferExpired))
-    );
-    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
-    f.client.cancel_transfer_offer(&unit_id);
-    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 0);
-}
-
-#[test]
-fn test_transfer_count_settings_require_current_brand_admin_and_emit_event() {
-    use crate::events::BatchTransferLimitUpdated;
-    use soroban_sdk::events::Event;
-
-    let f = TestFixture::setup();
-    let unit_id = activate_transfer_count_unit(&f);
-    let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
-    assert_eq!(
-        f.client
-            .try_set_max_transfers(&f.brand, &f.hash_str("MISSING"), &Some(2)),
-        Err(Ok(RegistryError::BatchNotFound))
-    );
-    let rotated = Address::generate(&f.env);
-    f.client.rotate_brand_admin(&f.brand, &rotated);
-    let args: Vec<soroban_sdk::Val> =
-        (f.brand.clone(), batch_id.clone(), Some(2u32)).into_val(&f.env);
+    let rotated_admin = Address::generate(&f.env);
+    f.client.rotate_brand_admin(&f.brand, &rotated_admin);
+    let args: Vec<soroban_sdk::Val> = (f.brand.clone(), unit_id.clone(), 1u32).into_val(&f.env);
+    // Owners, service centers, registry admins and the former brand key cannot authorize.
     for unauthorized in [&f.alice, &f.service_center, &f.admin, &f.brand] {
         f.env.mock_auths(&[MockAuth {
             address: unauthorized,
             invoke: &MockAuthInvoke {
                 contract: &f.contract_id,
-                fn_name: "set_max_transfers",
+                fn_name: "extend_warranty",
                 args: args.clone(),
                 sub_invokes: &[],
             },
         }]);
         assert!(f
             .client
-            .try_set_max_transfers(&f.brand, &batch_id, &Some(2))
+            .try_extend_warranty(&f.brand, &unit_id, &1)
             .is_err());
-        assert_eq!(
-            f.client
-                .get_batch(&f.brand, &batch_id)
-                .unwrap()
-                .max_transfers,
-            None
-        );
+        assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
     }
     f.env.mock_auths(&[MockAuth {
-        address: &rotated,
+        address: &rotated_admin,
         invoke: &MockAuthInvoke {
             contract: &f.contract_id,
-            fn_name: "set_max_transfers",
+            fn_name: "extend_warranty",
             args,
             sub_invokes: &[],
         },
     }]);
-    f.client.set_max_transfers(&f.brand, &batch_id, &Some(2));
     assert_eq!(
-        f.env.events().all(),
-        [BatchTransferLimitUpdated {
-            brand: f.brand.clone(),
-            batch_id: batch_id.clone(),
-            max_transfers: Some(2),
-        }
-        .to_xdr(&f.env, &f.contract_id)]
-    );
-    assert_eq!(
-        f.client
-            .get_batch(&f.brand, &batch_id)
-            .unwrap()
-            .max_transfers,
-        Some(2)
+        f.client.extend_warranty(&f.brand, &unit_id, &1),
+        before.warranty_expiry + SECONDS_PER_MONTH
     );
 }
 
 #[test]
-fn test_transfer_count_overflow_cannot_reset_counter() {
+fn test_extend_warranty_missing_and_nonoperational_units() {
     let f = TestFixture::setup();
-    let unit_id = activate_transfer_count_unit(&f);
+    let unit_id = activate_warranty_unit(&f, 12);
+    assert_eq!(
+        f.client
+            .try_extend_warranty(&f.brand, &f.hash_str("MISSING"), &1),
+        Err(Ok(RegistryError::UnitNotFound))
+    );
+    for (status, error) in [
+        (UnitStatus::Recalled, RegistryError::BatchRecalled),
+        (UnitStatus::Retired, RegistryError::UnitRetired),
+        (UnitStatus::Flagged, RegistryError::UnitFlagged),
+    ] {
+        f.env.as_contract(&f.contract_id, || {
+            let mut unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
+            unit.status = status;
+            crate::storage::set_unit(&f.env, &unit_id, &unit);
+        });
+        let before = f.client.get_unit(&unit_id).unwrap();
+        assert_eq!(
+            f.client.try_extend_warranty(&f.brand, &unit_id, &1),
+            Err(Ok(error))
+        );
+        assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+    }
+    // A recalled batch also blocks extensions of a unit whose stored status is Active.
     f.env.as_contract(&f.contract_id, || {
         let mut unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
-        unit.transfer_count = u32::MAX;
+        unit.status = UnitStatus::Active;
         crate::storage::set_unit(&f.env, &unit_id, &unit);
     });
+    let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
+    f.client
+        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
     assert_eq!(
-        f.client.try_create_transfer_offer(
-            &unit_id,
-            &f.hash_str("CODE"),
-            &(f.env.ledger().timestamp() + 1000)
-        ),
-        Err(Ok(RegistryError::TransferLimitReached))
+        f.client.try_extend_warranty(&f.brand, &unit_id, &1),
+        Err(Ok(RegistryError::BatchRecalled))
     );
-    assert_eq!(
-        f.client.get_unit(&unit_id).unwrap().transfer_count,
-        u32::MAX
-    );
+}
+
+#[test]
+fn test_extend_warranty_refreshes_unit_ttl() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 1);
+    f.env
+        .ledger()
+        .with_mut(|li| li.sequence_number += 1_200_000);
+    f.client.bump_unit_ttl(&unit_id);
+    f.env.ledger().with_mut(|li| li.sequence_number += 800_000);
+    let old_ttl = f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Unit(unit_id.clone()))
+    });
+    f.client.extend_warranty(&f.brand, &unit_id, &6);
+    let new_ttl = f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Unit(unit_id.clone()))
+    });
+    assert!(new_ttl > old_ttl);
 }
 #[test]
 fn test_merged_batch_metadata_and_expiration_storage() {
@@ -1215,63 +1184,4 @@ fn test_merged_legacy_brand_governance() {
     assert!(!f.client.is_service_center(&f.brand, &f.service_center));
     assert!(f.client.approve_brand_action(&f.alice, &f.brand, &proposal));
     assert!(f.client.is_service_center(&f.brand, &f.service_center));
-}
-
-#[test]
-fn test_transfer_count_legacy_records_and_retirement() {
-    use soroban_sdk::{Map, Symbol, TryFromVal, Val};
-
-    let f = TestFixture::setup();
-    let unit_id = activate_transfer_count_unit(&f);
-    let before = f.client.get_unit(&unit_id).unwrap();
-    f.env.as_contract(&f.contract_id, || {
-        let unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
-        let value: Val = unit.into_val(&f.env);
-        let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &value).unwrap();
-        fields.remove(Symbol::new(&f.env, "transfer_count"));
-        f.env
-            .storage()
-            .persistent()
-            .set(&DataKey::Unit(unit_id.clone()), &fields);
-        let batch = crate::storage::get_batch(&f.env, &f.brand, &before.batch_id).unwrap();
-        let value: Val = batch.into_val(&f.env);
-        let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &value).unwrap();
-        fields.remove(Symbol::new(&f.env, "max_transfers"));
-        f.env.storage().persistent().set(
-            &DataKey::Batch(f.brand.clone(), before.batch_id.clone()),
-            &fields,
-        );
-    });
-    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
-    assert_eq!(
-        f.client
-            .get_batch(&f.brand, &before.batch_id)
-            .unwrap()
-            .max_transfers,
-        None
-    );
-    f.client
-        .set_max_transfers(&f.brand, &before.batch_id, &Some(1));
-    let code = Bytes::from_slice(&f.env, b"LEGACY-COUNT");
-    let hash = sha256_bytes(&f.env, &code);
-    let expires_at = f.env.ledger().timestamp() + 10_000;
-    f.client.create_transfer_offer(&unit_id, &hash, &expires_at);
-    f.client.redeem_transfer(&unit_id, &code, &f.bob);
-    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 1);
-    assert_eq!(
-        f.client
-            .try_create_transfer_offer(&unit_id, &hash, &expires_at),
-        Err(Ok(RegistryError::TransferLimitReached)),
-    );
-    f.client
-        .retire_unit(&f.bob, &unit_id, &1, &f.hash_str("RECYCLING-CERT"));
-    f.client
-        .set_max_transfers(&f.brand, &before.batch_id, &None);
-    assert_eq!(
-        f.client
-            .try_create_transfer_offer(&unit_id, &hash, &expires_at),
-        Err(Ok(RegistryError::UnitRetired)),
-    );
-    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 1);
-    assert!(f.client.get_unit_retirement(&unit_id).is_some());
 }
