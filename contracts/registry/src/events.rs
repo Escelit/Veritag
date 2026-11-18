@@ -135,6 +135,16 @@ pub struct UnitFlagged {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnitRetired {
+    #[topic]
+    pub unit_id: BytesN<32>,
+    pub caller: Address,
+    pub reason_code: u32,
+    pub cert_hash: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchRecalled {
     #[topic]
     pub brand: Address,

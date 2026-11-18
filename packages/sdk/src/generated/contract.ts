@@ -298,6 +298,12 @@ export interface Client {
   get_config: (options?: MethodOptions) => Promise<AssembledTransaction<Option<Config>>>
 
   /**
+   * Construct and simulate a retire_unit transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Permanently retires a unit and records its recycling certificate (owner or brand admin).
+   */
+  retire_unit: ({caller, unit_id, reason_code, cert_hash}: {caller: string, unit_id: Buffer, reason_code: u32, cert_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
    * Construct and simulate a commit_batch transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Commits a production batch Merkle root for a verified brand.
    */
@@ -519,6 +525,7 @@ export class Client extends ContractClient {
         "AAAAAQAAAAAAAAAAAAAAE0JyYW5kQWN0aW9uUHJvcG9zYWwAAAAABQAAAAAAAAAGYWN0aW9uAAAAAAfQAAAAC0JyYW5kQWN0aW9uAAAAAAAAAAAQYWRtaW5fZ2VuZXJhdGlvbgAAAAQAAAAAAAAACWFwcHJvdmFscwAAAAAAA+oAAAATAAAAAAAAAAZjYWxsZXIAAAAAABMAAAAAAAAACGV4ZWN1dGVkAAAAAQ==",
         "AAAABQAAAAAAAAAAAAAACkNsYWltRmlsZWQAAAAAAAEAAAALY2xhaW1fZmlsZWQAAAAAAwAAAAAAAAAHdW5pdF9pZAAAAAPuAAAAIAAAAAEAAAAAAAAACGNsYWltX2lkAAAABAAAAAAAAAAAAAAADnNlcnZpY2VfY2VudGVyAAAAAAATAAAAAAAAAAI=",
         "AAAABQAAAAAAAAAAAAAAC1VuaXRGbGFnZ2VkAAAAAAEAAAAMdW5pdF9mbGFnZ2VkAAAAAgAAAAAAAAAHdW5pdF9pZAAAAAPuAAAAIAAAAAEAAAAAAAAAC3JlYXNvbl9oYXNoAAAAA+4AAAAgAAAAAAAAAAI=",
+        "AAAABQAAAAAAAAAAAAAAC1VuaXRSZXRpcmVkAAAAAAEAAAAMdW5pdF9yZXRpcmVkAAAABAAAAAAAAAAHdW5pdF9pZAAAAAPuAAAAIAAAAAEAAAAAAAAABmNhbGxlcgAAAAAAEwAAAAAAAAAAAAAAC3JlYXNvbl9jb2RlAAAAAAQAAAAAAAAAAAAAAAljZXJ0X2hhc2gAAAAAAAPuAAAAIAAAAAAAAAAC",
         "AAAABQAAAAAAAAAAAAAADUJhdGNoUmVjYWxsZWQAAAAAAAABAAAADmJhdGNoX3JlY2FsbGVkAAAAAAADAAAAAAAAAAVicmFuZAAAAAAAABMAAAABAAAAAAAAAAhiYXRjaF9pZAAAA+4AAAAgAAAAAQAAAAAAAAALcmVhc29uX2hhc2gAAAAD7gAAACAAAAAAAAAAAg==",
         "AAAABQAAAAAAAAAAAAAADUJyYW5kVmVyaWZpZWQAAAAAAAABAAAADmJyYW5kX3ZlcmlmaWVkAAAAAAABAAAAAAAAAAVicmFuZAAAAAAAABMAAAABAAAAAg==",
         "AAAABQAAAAAAAAAAAAAADUNsYWltUmVzb2x2ZWQAAAAAAAABAAAADmNsYWltX3Jlc29sdmVkAAAAAAAEAAAAAAAAAAd1bml0X2lkAAAAA+4AAAAgAAAAAQAAAAAAAAAIY2xhaW1faWQAAAAEAAAAAAAAAAAAAAAHb3V0Y29tZQAAAAfQAAAADENsYWltT3V0Y29tZQAAAAAAAAAAAAAAC3JlcG9ydF9oYXNoAAAAA+4AAAAgAAAAAAAAAAI=",
@@ -547,6 +554,7 @@ export class Client extends ContractClient {
         get_claim: this.txFromJSON<Option<Claim>>,
         file_claim: this.txFromJSON<Result<u32>>,
         get_config: this.txFromJSON<Option<Config>>,
+        retire_unit: this.txFromJSON<Result<void>>,
         commit_batch: this.txFromJSON<Result<void>>,
         recall_batch: this.txFromJSON<Result<void>>,
         rotate_admin: this.txFromJSON<Result<void>>,

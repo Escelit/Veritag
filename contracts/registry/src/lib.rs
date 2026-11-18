@@ -334,6 +334,12 @@ impl VeritagRegistry {
     ) -> Result<BytesN<32>, RegistryError> {
         first_owner.require_auth();
 
+        let unit_id = merkle::compute_unit_id(&env, &brand, &batch_id, &serial_hash);
+        let existing_unit = storage::get_unit(&env, &unit_id);
+        if let Some(unit) = &existing_unit {
+            Self::ensure_unit_not_retired(unit)?;
+        }
+
         let batch =
             storage::get_batch(&env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         if batch.recalled {
@@ -343,8 +349,7 @@ impl VeritagRegistry {
             return Err(RegistryError::BatchExpired);
         }
 
-        let unit_id = merkle::compute_unit_id(&env, &brand, &batch_id, &serial_hash);
-        if storage::has_unit(&env, &unit_id) {
+        if existing_unit.is_some() {
             DuplicateAttempt {
                 unit_id,
                 caller: first_owner,
@@ -393,6 +398,46 @@ impl VeritagRegistry {
         .publish(&env);
 
         Ok(unit_id)
+    }
+
+    /// Permanently retires a unit and records its recycling certificate (owner or brand admin).
+    pub fn retire_unit(
+        env: Env,
+        caller: Address,
+        unit_id: BytesN<32>,
+        reason_code: u32,
+        cert_hash: BytesN<32>,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+        let mut unit = storage::get_unit(&env, &unit_id).ok_or(RegistryError::UnitNotFound)?;
+        if caller != unit.owner {
+            let brand =
+                storage::get_brand(&env, &unit.brand).ok_or(RegistryError::BrandNotFound)?;
+            if caller != brand.admin {
+                return Err(RegistryError::NotAuthorized);
+            }
+        }
+        Self::ensure_unit_not_retired(&unit)?;
+        let retirement = UnitRetirement {
+            caller: caller.clone(),
+            reason_code,
+            cert_hash: cert_hash.clone(),
+            retired_at: env.ledger().timestamp(),
+        };
+        unit.status = UnitStatus::Retired;
+        unit.history_len = unit.history_len.saturating_add(1);
+        storage::remove_offer(&env, &unit_id);
+        storage::set_unit(&env, &unit_id, &unit);
+        storage::set_unit_retirement(&env, &unit_id, &retirement, unit.warranty_expiry);
+        storage::extend_instance_ttl(&env);
+        UnitRetired {
+            unit_id,
+            caller,
+            reason_code,
+            cert_hash,
+        }
+        .publish(&env);
+        Ok(())
     }
 
     /// Persists a verified duplicate activation attempt on-chain when an already-claimed unit's
@@ -588,6 +633,7 @@ impl VeritagRegistry {
         }
 
         let mut unit = storage::get_unit(&env, &unit_id).ok_or(RegistryError::UnitNotFound)?;
+        Self::ensure_unit_not_retired(&unit)?;
         let mut claim =
             storage::get_claim(&env, &unit_id, claim_id).ok_or(RegistryError::ClaimNotFound)?;
 
@@ -637,6 +683,7 @@ impl VeritagRegistry {
         let brand_record =
             storage::get_brand(&env, &unit.brand).ok_or(RegistryError::BrandNotFound)?;
         brand_record.admin.require_auth();
+        Self::ensure_unit_not_retired(&unit)?;
 
         unit.status = UnitStatus::Flagged;
         unit.history_len = unit.history_len.saturating_add(1);
@@ -750,6 +797,10 @@ impl VeritagRegistry {
     pub fn get_unit(env: Env, unit_id: BytesN<32>) -> Option<UnitView> {
         let unit = storage::get_unit(&env, &unit_id)?;
         Some(Self::build_unit_view(&env, unit_id, unit))
+    }
+
+    pub fn get_unit_retirement(env: Env, unit_id: BytesN<32>) -> Option<UnitRetirement> {
+        storage::get_unit_retirement(&env, &unit_id)
     }
 
     pub fn get_claim(env: Env, unit_id: BytesN<32>, claim_id: u32) -> Option<Claim> {
@@ -892,6 +943,7 @@ impl VeritagRegistry {
     }
 
     fn ensure_unit_operational(env: &Env, unit: &Unit) -> Result<(), RegistryError> {
+        Self::ensure_unit_not_retired(unit)?;
         let batch = storage::get_batch(env, &unit.brand, &unit.batch_id)
             .ok_or(RegistryError::BatchNotFound)?;
         if batch.recalled || unit.status == UnitStatus::Recalled {
@@ -900,6 +952,10 @@ impl VeritagRegistry {
         if unit.status == UnitStatus::Flagged {
             return Err(RegistryError::UnitFlagged);
         }
+        Ok(())
+    }
+
+    fn ensure_unit_not_retired(unit: &Unit) -> Result<(), RegistryError> {
         if unit.status == UnitStatus::Retired {
             return Err(RegistryError::UnitRetired);
         }
