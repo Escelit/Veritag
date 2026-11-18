@@ -38,7 +38,8 @@ pub enum RegistryError {
     InvalidInput = 22,
     UnitRetired = 23,
     BatchExpired = 24,
-    WarrantyLimitReached = 25,
+    BatchFrozen = 25,
+    WarrantyLimitReached = 26,
 }
 
 #[contracttype]
@@ -70,6 +71,8 @@ pub struct BrandAdminConfig {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrandAction {
+    FreezeBatch(BytesN<32>),
+    UnfreezeBatch(BytesN<32>),
     RecallBatch(BytesN<32>, BytesN<32>),
     RegisterServiceCenter(Address),
     RevokeServiceCenter(Address),
@@ -99,6 +102,7 @@ pub struct Batch {
     pub unit_count: u64,
     pub created_at: u64,
     pub recalled: bool,
+    pub frozen: bool,
     pub expires_at: Option<u64>,
     pub status: BatchStatus,
 }

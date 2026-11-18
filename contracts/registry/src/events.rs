@@ -172,3 +172,21 @@ pub struct BatchRecalled {
     pub batch_id: BytesN<32>,
     pub reason_hash: BytesN<32>,
 }
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchFrozen {
+    #[topic]
+    pub brand: Address,
+    #[topic]
+    pub batch_id: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchUnfrozen {
+    #[topic]
+    pub brand: Address,
+    #[topic]
+    pub batch_id: BytesN<32>,
+}
