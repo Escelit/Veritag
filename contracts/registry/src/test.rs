@@ -634,3 +634,295 @@ fn test_ttl_extension_and_strict_authorization() {
         .try_create_transfer_offer(&unit_id, &code_hash, &expires_at)
         .is_ok());
 }
+
+#[test]
+fn test_brand_multisig() {
+    use crate::{
+        events::{BatchRecalled, BrandActionExecuted, BrandActionProposed},
+        types::{BrandAction, BrandAdminConfig},
+    };
+    use soroban_sdk::events::Event;
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("MULTISIG");
+    let reason = f.hash_str("SAFETY");
+    let (root, _) = f.build_sample_batch(1);
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &reason, &1);
+    let config = BrandAdminConfig {
+        admins: Vec::from_array(&f.env, [f.brand.clone(), f.alice.clone(), f.bob.clone()]),
+        threshold: 2,
+    };
+    f.client.configure_brand_admins(&f.brand, &config);
+    assert_eq!(f.client.get_brand_admin_config(&f.brand), Some(config));
+    let action = BrandAction::RecallBatch(batch_id.clone(), reason.clone());
+    assert_eq!(
+        f.client
+            .try_propose_brand_action(&f.service_center, &f.brand, &action),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    let id = f.client.propose_brand_action(&f.brand, &f.brand, &action);
+    let proposed = BrandActionProposed {
+        brand: f.brand.clone(),
+        proposal_id: id,
+        caller: f.brand.clone(),
+        action: action.clone(),
+    };
+    assert_eq!(
+        f.env.events().all(),
+        Vec::from_array(
+            &f.env,
+            [(
+                f.contract_id.clone(),
+                proposed.topics(&f.env),
+                proposed.data(&f.env)
+            )]
+        )
+    );
+    let pending = f.client.get_brand_action(&f.brand, &id).unwrap();
+    assert!(!pending.executed);
+    assert_eq!(pending.approvals.len(), 1);
+    assert!(!f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
+    assert_eq!(
+        f.client.try_recall_batch(&f.brand, &batch_id, &reason),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert_eq!(
+        f.client.try_register_service_center(&f.brand, &f.bob),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert_eq!(
+        f.client
+            .try_revoke_service_center(&f.brand, &f.service_center),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert_eq!(
+        f.client.try_rotate_brand_admin(&f.brand, &f.bob),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    let current = f.client.get_brand_admin_config(&f.brand).unwrap();
+    assert_eq!(
+        f.client.try_configure_brand_admins(&f.brand, &current),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert_eq!(
+        f.client.try_approve_brand_action(&f.brand, &f.brand, &id),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert_eq!(
+        f.client
+            .try_approve_brand_action(&f.service_center, &f.brand, &id),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert!(f.client.approve_brand_action(&f.alice, &f.brand, &id));
+    let executed = BrandActionExecuted {
+        brand: f.brand.clone(),
+        proposal_id: id,
+        action,
+        approvals: Vec::from_array(&f.env, [f.brand.clone(), f.alice.clone()]),
+    };
+    assert_eq!(
+        f.env.events().all(),
+        Vec::from_array(
+            &f.env,
+            [
+                (
+                    f.contract_id.clone(),
+                    BatchRecalled {
+                        brand: f.brand.clone(),
+                        batch_id: batch_id.clone(),
+                        reason_hash: reason.clone()
+                    }
+                    .topics(&f.env),
+                    BatchRecalled {
+                        brand: f.brand.clone(),
+                        batch_id: batch_id.clone(),
+                        reason_hash: reason.clone()
+                    }
+                    .data(&f.env)
+                ),
+                (
+                    f.contract_id.clone(),
+                    executed.topics(&f.env),
+                    executed.data(&f.env)
+                )
+            ]
+        )
+    );
+    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
+    assert!(f.client.get_brand_action(&f.brand, &id).unwrap().executed);
+    assert_eq!(
+        f.client.try_approve_brand_action(&f.bob, &f.brand, &id),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+}
+
+#[test]
+fn test_brand_multisig_service_centers_rotation_and_stale_votes() {
+    use crate::types::{BrandAction, BrandAdminConfig};
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let config = BrandAdminConfig {
+        admins: Vec::from_array(&f.env, [f.brand.clone(), f.alice.clone(), f.bob.clone()]),
+        threshold: 3,
+    };
+    f.client.configure_brand_admins(&f.brand, &config);
+    let center = Address::generate(&f.env);
+    let id = f.client.propose_brand_action(
+        &f.brand,
+        &f.brand,
+        &BrandAction::RegisterServiceCenter(center.clone()),
+    );
+    assert!(!f.client.approve_brand_action(&f.alice, &f.brand, &id));
+    assert!(!f.client.is_service_center(&f.brand, &center));
+    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &id));
+    assert!(f.client.is_service_center(&f.brand, &center));
+    let stale = f.client.propose_brand_action(
+        &f.alice,
+        &f.brand,
+        &BrandAction::RevokeServiceCenter(center.clone()),
+    );
+    let new_config = BrandAdminConfig {
+        admins: Vec::from_array(&f.env, [f.alice.clone(), f.bob.clone()]),
+        threshold: 2,
+    };
+    let rotation = f.client.propose_brand_action(
+        &f.brand,
+        &f.brand,
+        &BrandAction::ConfigureAdmins(new_config.clone()),
+    );
+    assert!(!f.client.approve_brand_action(&f.alice, &f.brand, &rotation));
+    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &rotation));
+    assert_eq!(f.client.get_brand_admin_config(&f.brand), Some(new_config));
+    assert_eq!(f.client.get_brand(&f.brand).unwrap().admin, f.alice);
+    assert_eq!(
+        f.client.try_approve_brand_action(&f.bob, &f.brand, &stale),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert_eq!(
+        f.client.try_propose_brand_action(
+            &f.brand,
+            &f.brand,
+            &BrandAction::RevokeServiceCenter(center.clone())
+        ),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    let revoke = f.client.propose_brand_action(
+        &f.alice,
+        &f.brand,
+        &BrandAction::RevokeServiceCenter(center.clone()),
+    );
+    assert!(revoke > rotation);
+    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &revoke));
+    assert!(!f.client.is_service_center(&f.brand, &center));
+}
+
+#[test]
+fn test_brand_multisig_validation_and_authentication() {
+    use crate::types::{BrandAction, BrandAdminConfig};
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    for config in [
+        BrandAdminConfig {
+            admins: Vec::new(&f.env),
+            threshold: 1,
+        },
+        BrandAdminConfig {
+            admins: Vec::from_array(&f.env, [f.brand.clone()]),
+            threshold: 0,
+        },
+        BrandAdminConfig {
+            admins: Vec::from_array(&f.env, [f.brand.clone()]),
+            threshold: 2,
+        },
+        BrandAdminConfig {
+            admins: Vec::from_array(&f.env, [f.brand.clone(), f.brand.clone()]),
+            threshold: 2,
+        },
+    ] {
+        assert_eq!(
+            f.client.try_configure_brand_admins(&f.brand, &config),
+            Err(Ok(RegistryError::InvalidInput))
+        );
+    }
+    let config = BrandAdminConfig {
+        admins: Vec::from_array(&f.env, [f.brand.clone(), f.alice.clone()]),
+        threshold: 2,
+    };
+    f.client.configure_brand_admins(&f.brand, &config);
+    let action = BrandAction::RegisterServiceCenter(f.bob.clone());
+    f.env.mock_auths(&[]);
+    assert!(f
+        .client
+        .try_propose_brand_action(&f.brand, &f.brand, &action)
+        .is_err());
+    f.env.mock_auths(&[MockAuth {
+        address: &f.brand,
+        invoke: &MockAuthInvoke {
+            contract: &f.contract_id,
+            fn_name: "propose_brand_action",
+            args: (f.brand.clone(), f.brand.clone(), action.clone()).into_val(&f.env),
+            sub_invokes: &[],
+        },
+    }]);
+    let id = f.client.propose_brand_action(&f.brand, &f.brand, &action);
+    f.env.mock_auths(&[]);
+    assert!(f
+        .client
+        .try_approve_brand_action(&f.alice, &f.brand, &id)
+        .is_err());
+    assert_eq!(
+        f.client
+            .get_brand_action(&f.brand, &id)
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
+    f.env.mock_auths(&[MockAuth {
+        address: &f.alice,
+        invoke: &MockAuthInvoke {
+            contract: &f.contract_id,
+            fn_name: "approve_brand_action",
+            args: (f.alice.clone(), f.brand.clone(), id).into_val(&f.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(f.client.approve_brand_action(&f.alice, &f.brand, &id));
+}
+
+#[test]
+fn test_brand_multisig_legacy_and_single_admin() {
+    use crate::types::BrandAction;
+    let f = TestFixture::setup();
+    let legacy = crate::storage::LegacyBrand {
+        admin: f.brand.clone(),
+        domain: String::from_str(&f.env, "legacy.example"),
+        verified: true,
+        registered_at: f.env.ledger().timestamp(),
+    };
+    f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Brand(f.brand.clone()), &legacy)
+    });
+    assert_eq!(
+        f.client.get_brand_admin_config(&f.brand).unwrap().threshold,
+        1
+    );
+    let action = BrandAction::RegisterServiceCenter(f.service_center.clone());
+    let id = f.client.propose_brand_action(&f.brand, &f.brand, &action);
+    assert!(f.client.get_brand_action(&f.brand, &id).unwrap().executed);
+    assert!(f.client.is_service_center(&f.brand, &f.service_center));
+    f.client.rotate_brand_admin(&f.brand, &f.alice);
+    assert_eq!(
+        f.client.get_brand_admin_config(&f.brand).unwrap().admins,
+        Vec::from_array(&f.env, [f.alice.clone()])
+    );
+    assert_eq!(
+        f.client
+            .try_propose_brand_action(&f.brand, &f.brand, &action),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+}

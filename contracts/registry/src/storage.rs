@@ -1,6 +1,18 @@
-use soroban_sdk::{contracttype, Address, BytesN, Env};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Map, String, Symbol, TryFromVal, Val, Vec};
 
-use crate::types::{Batch, Brand, Claim, Config, TransferOffer, Unit, SECONDS_PER_MONTH};
+use crate::types::{
+    Batch, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, TransferOffer, Unit,
+    SECONDS_PER_MONTH,
+};
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LegacyBrand {
+    pub admin: Address,
+    pub domain: String,
+    pub verified: bool,
+    pub registered_at: u64,
+}
 
 /// Approximate Stellar ledger close interval (~5 seconds per ledger).
 pub const SECONDS_PER_LEDGER: u64 = 5;
@@ -25,6 +37,7 @@ pub const OFFER_TTL_BUFFER_LEDGERS: u32 = DAY_IN_LEDGERS;
 pub enum DataKey {
     Config,
     Brand(Address),
+    BrandAction(Address, u32),
     ServiceCenter(Address, Address),
     Batch(Address, BytesN<32>),
     Unit(BytesN<32>),
@@ -107,9 +120,49 @@ pub fn set_config(env: &Env, config: &Config) {
 // --- Brand ---
 
 pub fn get_brand(env: &Env, brand: &Address) -> Option<Brand> {
+    let value: Val = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Brand(brand.clone()))?;
+    let fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid brand storage");
+    Some(if fields.len() == 4 {
+        let legacy = LegacyBrand::try_from_val(env, &value).expect("invalid brand storage");
+        Brand {
+            admin_config: BrandAdminConfig {
+                admins: Vec::from_array(env, [legacy.admin.clone()]),
+                threshold: 1,
+            },
+            admin: legacy.admin,
+            domain: legacy.domain,
+            verified: legacy.verified,
+            registered_at: legacy.registered_at,
+            admin_generation: 0,
+            next_action_id: 0,
+        }
+    } else {
+        Brand::try_from_val(env, &value).expect("invalid brand storage")
+    })
+}
+
+pub fn get_brand_action(
+    env: &Env,
+    brand: &Address,
+    proposal_id: u32,
+) -> Option<BrandActionProposal> {
     env.storage()
         .persistent()
-        .get(&DataKey::Brand(brand.clone()))
+        .get(&DataKey::BrandAction(brand.clone(), proposal_id))
+}
+
+pub fn set_brand_action(
+    env: &Env,
+    brand: &Address,
+    proposal_id: u32,
+    proposal: &BrandActionProposal,
+) {
+    let key = DataKey::BrandAction(brand.clone(), proposal_id);
+    env.storage().persistent().set(&key, proposal);
+    extend_persistent_baseline(env, &key);
 }
 
 pub fn set_brand(env: &Env, brand_addr: &Address, brand: &Brand) {
