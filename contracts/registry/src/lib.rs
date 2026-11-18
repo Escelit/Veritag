@@ -13,9 +13,9 @@ use crate::events::{
     TransferCancelled, TransferOffered, UnitActivated, UnitFlagged, UnitTransferred,
 };
 use crate::types::{
-    Batch, Brand, BrandAction, BrandActionProposal, BrandAdminConfig, Claim, ClaimOutcome, Config,
-    RegistryError, TransferOffer, Unit, UnitStatus, UnitView, VerifyResult, VerifyStatus,
-    DEFAULT_MAX_CLAIMS_PER_UNIT, SECONDS_PER_MONTH,
+    Batch, BatchStatus, Brand, Claim, ClaimOutcome, Config, RegistryError, TransferOffer, Unit,
+    UnitStatus, UnitView, VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
+    SECONDS_PER_MONTH,
 };
 
 const MAX_DOMAIN_LEN: u32 = 253;
@@ -269,6 +269,8 @@ impl VeritagRegistry {
     // -------------------------------------------------------------------------
 
     /// Commits a production batch Merkle root for a verified brand.
+    // Keep the existing Soroban ABI arguments alongside optional expiration.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_batch(
         env: Env,
         brand: Address,
@@ -277,8 +279,9 @@ impl VeritagRegistry {
         warranty_months: u32,
         product_meta_hash: BytesN<32>,
         unit_count: u64,
+        expires_at: Option<u64>,
     ) -> Result<(), RegistryError> {
-        if unit_count == 0 {
+        if unit_count == 0 || expires_at.is_some_and(|expiry| expiry <= env.ledger().timestamp()) {
             return Err(RegistryError::InvalidInput);
         }
         let brand_record = Self::require_verified_brand(&env, &brand)?;
@@ -296,6 +299,8 @@ impl VeritagRegistry {
             unit_count,
             created_at: env.ledger().timestamp(),
             recalled: false,
+            expires_at,
+            status: BatchStatus::Active,
         };
         storage::set_batch(&env, &brand, &batch_id, &batch);
         storage::extend_instance_ttl(&env);
@@ -331,6 +336,9 @@ impl VeritagRegistry {
             storage::get_batch(&env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         if batch.recalled {
             return Err(RegistryError::BatchRecalled);
+        }
+        if batch.status == BatchStatus::Expired {
+            return Err(RegistryError::BatchExpired);
         }
 
         let unit_id = merkle::compute_unit_id(&env, &brand, &batch_id, &serial_hash);
@@ -663,7 +671,8 @@ impl VeritagRegistry {
         let mut batch =
             storage::get_batch(env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         batch.recalled = true;
-        storage::set_batch(env, &brand, &batch_id, &batch);
+        batch.status = BatchStatus::Recalled;
+        storage::set_batch(&env, &brand, &batch_id, &batch);
 
         BatchRecalled {
             brand,

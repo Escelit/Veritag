@@ -34,6 +34,7 @@ pub enum RegistryError {
     ClaimAlreadyResolved = 21,
     InvalidInput = 22,
     UnitRetired = 23,
+    BatchExpired = 24,
 }
 
 #[contracttype]
@@ -91,6 +92,16 @@ pub struct Batch {
     pub unit_count: u64,
     pub created_at: u64,
     pub recalled: bool,
+    pub expires_at: Option<u64>,
+    pub status: BatchStatus,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BatchStatus {
+    Active,
+    Expired,
+    Recalled,
 }
 
 #[contracttype]

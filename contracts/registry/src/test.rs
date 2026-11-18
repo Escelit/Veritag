@@ -197,7 +197,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     let meta = f.hash_str("META");
     assert_eq!(
         f.client
-            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100),
+            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None),
         Err(Ok(RegistryError::BrandNotVerified))
     );
     assert_eq!(
@@ -216,7 +216,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     assert_eq!(f.client.get_brand(&f.brand).unwrap().admin, rotated_signer);
 
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100);
+        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None);
     assert!(f.client.get_batch(&f.brand, &batch_id).is_some());
 }
 
@@ -231,18 +231,39 @@ fn test_merkle_batch_commit_and_lazy_activation() {
 
     // Zero unit count rejected
     assert_eq!(
-        f.client
-            .try_commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &0),
+        f.client.try_commit_batch(
+            &f.brand,
+            &batch_id,
+            &merkle_root,
+            &12,
+            &meta_hash,
+            &0,
+            &None
+        ),
         Err(Ok(RegistryError::InvalidInput))
     );
 
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &5);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &12,
+        &meta_hash,
+        &5,
+        &None,
+    );
 
     // Duplicate batch rejected
     assert_eq!(
-        f.client
-            .try_commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &5),
+        f.client.try_commit_batch(
+            &f.brand,
+            &batch_id,
+            &merkle_root,
+            &12,
+            &meta_hash,
+            &5,
+            &None
+        ),
         Err(Ok(RegistryError::BatchExists))
     );
 
@@ -344,8 +365,15 @@ fn test_resale_transfer_offer_redeem_expiry_and_cancel() {
     let batch_id = f.hash_str("BATCH-RESALE");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(2);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &24, &meta_hash, &2);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &24,
+        &meta_hash,
+        &2,
+        &None,
+    );
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
     let unit_id = f
@@ -422,7 +450,7 @@ fn test_warranty_boundary_and_claims_workflow() {
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(2);
     f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &6, &meta_hash, &2);
+        .commit_batch(&f.brand, &batch_id, &merkle_root, &6, &meta_hash, &2, &None);
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
     let unit_id = f
@@ -501,8 +529,15 @@ fn test_flag_unit_and_recall_batch_across_entrypoints() {
     let batch_id = f.hash_str("BATCH-SAFETY");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(3);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &3);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &12,
+        &meta_hash,
+        &3,
+        &None,
+    );
 
     // Activate unit 0 and unit 1; leave unit 2 unactivated
     let u0 = f.client.activate(
@@ -577,8 +612,15 @@ fn test_ttl_extension_and_strict_authorization() {
     let batch_id = f.hash_str("BATCH-TTL");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(1);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &24, &meta_hash, &1);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &24,
+        &meta_hash,
+        &1,
+        &None,
+    );
 
     let unit_id = f.client.activate(
         &f.brand,
@@ -636,293 +678,142 @@ fn test_ttl_extension_and_strict_authorization() {
 }
 
 #[test]
-fn test_brand_multisig() {
-    use crate::{
-        events::{BatchRecalled, BrandActionExecuted, BrandActionProposed},
-        types::{BrandAction, BrandAdminConfig},
-    };
-    use soroban_sdk::events::Event;
+fn test_batch_expiration() {
+    use crate::types::BatchStatus;
     let f = TestFixture::setup();
     f.setup_verified_brand();
-    let batch_id = f.hash_str("MULTISIG");
-    let reason = f.hash_str("SAFETY");
-    let (root, _) = f.build_sample_batch(1);
+    let batch_id = f.hash_str("PERISHABLES");
+    let meta = f.hash_str("META");
+    let (root, units) = f.build_sample_batch(3);
+    let expiry = f.env.ledger().timestamp() + 100;
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &reason, &1);
-    let config = BrandAdminConfig {
-        admins: Vec::from_array(&f.env, [f.brand.clone(), f.alice.clone(), f.bob.clone()]),
-        threshold: 2,
-    };
-    f.client.configure_brand_admins(&f.brand, &config);
-    assert_eq!(f.client.get_brand_admin_config(&f.brand), Some(config));
-    let action = BrandAction::RecallBatch(batch_id.clone(), reason.clone());
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &3, &Some(expiry));
     assert_eq!(
-        f.client
-            .try_propose_brand_action(&f.service_center, &f.brand, &action),
-        Err(Ok(RegistryError::NotAuthorized))
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Active
     );
-    let id = f.client.propose_brand_action(&f.brand, &f.brand, &action);
-    let proposed = BrandActionProposed {
-        brand: f.brand.clone(),
-        proposal_id: id,
-        caller: f.brand.clone(),
-        action: action.clone(),
-    };
-    assert_eq!(
-        f.env.events().all(),
-        Vec::from_array(
-            &f.env,
-            [(
-                f.contract_id.clone(),
-                proposed.topics(&f.env),
-                proposed.data(&f.env)
-            )]
-        )
-    );
-    let pending = f.client.get_brand_action(&f.brand, &id).unwrap();
-    assert!(!pending.executed);
-    assert_eq!(pending.approvals.len(), 1);
-    assert!(!f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
-    assert_eq!(
-        f.client.try_recall_batch(&f.brand, &batch_id, &reason),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    assert_eq!(
-        f.client.try_register_service_center(&f.brand, &f.bob),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    assert_eq!(
-        f.client
-            .try_revoke_service_center(&f.brand, &f.service_center),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    assert_eq!(
-        f.client.try_rotate_brand_admin(&f.brand, &f.bob),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    let current = f.client.get_brand_admin_config(&f.brand).unwrap();
-    assert_eq!(
-        f.client.try_configure_brand_admins(&f.brand, &current),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    assert_eq!(
-        f.client.try_approve_brand_action(&f.brand, &f.brand, &id),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    assert_eq!(
-        f.client
-            .try_approve_brand_action(&f.service_center, &f.brand, &id),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    assert!(f.client.approve_brand_action(&f.alice, &f.brand, &id));
-    let executed = BrandActionExecuted {
-        brand: f.brand.clone(),
-        proposal_id: id,
-        action,
-        approvals: Vec::from_array(&f.env, [f.brand.clone(), f.alice.clone()]),
-    };
-    assert_eq!(
-        f.env.events().all(),
-        Vec::from_array(
-            &f.env,
-            [
-                (
-                    f.contract_id.clone(),
-                    BatchRecalled {
-                        brand: f.brand.clone(),
-                        batch_id: batch_id.clone(),
-                        reason_hash: reason.clone()
-                    }
-                    .topics(&f.env),
-                    BatchRecalled {
-                        brand: f.brand.clone(),
-                        batch_id: batch_id.clone(),
-                        reason_hash: reason.clone()
-                    }
-                    .data(&f.env)
-                ),
-                (
-                    f.contract_id.clone(),
-                    executed.topics(&f.env),
-                    executed.data(&f.env)
-                )
-            ]
-        )
-    );
-    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
-    assert!(f.client.get_brand_action(&f.brand, &id).unwrap().executed);
-    assert_eq!(
-        f.client.try_approve_brand_action(&f.bob, &f.brand, &id),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-}
-
-#[test]
-fn test_brand_multisig_service_centers_rotation_and_stale_votes() {
-    use crate::types::{BrandAction, BrandAdminConfig};
-    let f = TestFixture::setup();
-    f.setup_verified_brand();
-    let config = BrandAdminConfig {
-        admins: Vec::from_array(&f.env, [f.brand.clone(), f.alice.clone(), f.bob.clone()]),
-        threshold: 3,
-    };
-    f.client.configure_brand_admins(&f.brand, &config);
-    let center = Address::generate(&f.env);
-    let id = f.client.propose_brand_action(
+    f.client.activate(
         &f.brand,
-        &f.brand,
-        &BrandAction::RegisterServiceCenter(center.clone()),
-    );
-    assert!(!f.client.approve_brand_action(&f.alice, &f.brand, &id));
-    assert!(!f.client.is_service_center(&f.brand, &center));
-    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &id));
-    assert!(f.client.is_service_center(&f.brand, &center));
-    let stale = f.client.propose_brand_action(
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
         &f.alice,
-        &f.brand,
-        &BrandAction::RevokeServiceCenter(center.clone()),
     );
-    let new_config = BrandAdminConfig {
-        admins: Vec::from_array(&f.env, [f.alice.clone(), f.bob.clone()]),
-        threshold: 2,
-    };
-    let rotation = f.client.propose_brand_action(
+    f.env.ledger().with_mut(|li| li.timestamp = expiry);
+    f.client.activate(
         &f.brand,
-        &f.brand,
-        &BrandAction::ConfigureAdmins(new_config.clone()),
+        &batch_id,
+        &units[1].0,
+        &units[1].3,
+        &units[1].1,
+        &f.alice,
     );
-    assert!(!f.client.approve_brand_action(&f.alice, &f.brand, &rotation));
-    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &rotation));
-    assert_eq!(f.client.get_brand_admin_config(&f.brand), Some(new_config));
-    assert_eq!(f.client.get_brand(&f.brand).unwrap().admin, f.alice);
+    f.env.ledger().with_mut(|li| li.timestamp = expiry + 1);
     assert_eq!(
-        f.client.try_approve_brand_action(&f.bob, &f.brand, &stale),
-        Err(Ok(RegistryError::NotAuthorized))
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Expired
     );
     assert_eq!(
-        f.client.try_propose_brand_action(
+        f.client.try_activate(
             &f.brand,
-            &f.brand,
-            &BrandAction::RevokeServiceCenter(center.clone())
+            &batch_id,
+            &units[2].0,
+            &units[2].3,
+            &units[2].1,
+            &f.alice
         ),
-        Err(Ok(RegistryError::NotAuthorized))
+        Err(Ok(RegistryError::BatchExpired))
     );
-    let revoke = f.client.propose_brand_action(
-        &f.alice,
-        &f.brand,
-        &BrandAction::RevokeServiceCenter(center.clone()),
+    let unit_id = f.client.compute_unit_id(&f.brand, &batch_id, &units[2].0);
+    assert!(f.client.get_unit(&unit_id).is_none());
+    f.client.recall_batch(&f.brand, &batch_id, &meta);
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Recalled
     );
-    assert!(revoke > rotation);
-    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &revoke));
-    assert!(!f.client.is_service_center(&f.brand, &center));
+    assert_eq!(
+        f.client.try_activate(
+            &f.brand,
+            &batch_id,
+            &units[2].0,
+            &units[2].3,
+            &units[2].1,
+            &f.alice
+        ),
+        Err(Ok(RegistryError::BatchRecalled))
+    );
 }
 
 #[test]
-fn test_brand_multisig_validation_and_authentication() {
-    use crate::types::{BrandAction, BrandAdminConfig};
+fn test_batch_expiration_invalid_commit_and_no_expiry() {
     let f = TestFixture::setup();
     f.setup_verified_brand();
-    for config in [
-        BrandAdminConfig {
-            admins: Vec::new(&f.env),
-            threshold: 1,
-        },
-        BrandAdminConfig {
-            admins: Vec::from_array(&f.env, [f.brand.clone()]),
-            threshold: 0,
-        },
-        BrandAdminConfig {
-            admins: Vec::from_array(&f.env, [f.brand.clone()]),
-            threshold: 2,
-        },
-        BrandAdminConfig {
-            admins: Vec::from_array(&f.env, [f.brand.clone(), f.brand.clone()]),
-            threshold: 2,
-        },
-    ] {
+    let batch_id = f.hash_str("NO-EXPIRY");
+    let meta = f.hash_str("META");
+    let (root, units) = f.build_sample_batch(1);
+    let now = f.env.ledger().timestamp();
+    for expiry in [0, now - 1, now] {
         assert_eq!(
-            f.client.try_configure_brand_admins(&f.brand, &config),
+            f.client
+                .try_commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &Some(expiry)),
             Err(Ok(RegistryError::InvalidInput))
         );
+        assert!(f.client.get_batch(&f.brand, &batch_id).is_none());
     }
-    let config = BrandAdminConfig {
-        admins: Vec::from_array(&f.env, [f.brand.clone(), f.alice.clone()]),
-        threshold: 2,
-    };
-    f.client.configure_brand_admins(&f.brand, &config);
-    let action = BrandAction::RegisterServiceCenter(f.bob.clone());
-    f.env.mock_auths(&[]);
-    assert!(f
-        .client
-        .try_propose_brand_action(&f.brand, &f.brand, &action)
-        .is_err());
-    f.env.mock_auths(&[MockAuth {
-        address: &f.brand,
-        invoke: &MockAuthInvoke {
-            contract: &f.contract_id,
-            fn_name: "propose_brand_action",
-            args: (f.brand.clone(), f.brand.clone(), action.clone()).into_val(&f.env),
-            sub_invokes: &[],
-        },
-    }]);
-    let id = f.client.propose_brand_action(&f.brand, &f.brand, &action);
-    f.env.mock_auths(&[]);
-    assert!(f
-        .client
-        .try_approve_brand_action(&f.alice, &f.brand, &id)
-        .is_err());
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &None);
     assert_eq!(
-        f.client
-            .get_brand_action(&f.brand, &id)
-            .unwrap()
-            .approvals
-            .len(),
-        1
+        f.client.get_batch(&f.brand, &batch_id).unwrap().expires_at,
+        None
     );
-    f.env.mock_auths(&[MockAuth {
-        address: &f.alice,
-        invoke: &MockAuthInvoke {
-            contract: &f.contract_id,
-            fn_name: "approve_brand_action",
-            args: (f.alice.clone(), f.brand.clone(), id).into_val(&f.env),
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(f.client.approve_brand_action(&f.alice, &f.brand, &id));
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = now + SECONDS_PER_MONTH * 120);
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
 }
 
 #[test]
-fn test_brand_multisig_legacy_and_single_admin() {
-    use crate::types::BrandAction;
+fn test_batch_expiration_legacy_storage() {
     let f = TestFixture::setup();
-    let legacy = crate::storage::LegacyBrand {
-        admin: f.brand.clone(),
-        domain: String::from_str(&f.env, "legacy.example"),
-        verified: true,
-        registered_at: f.env.ledger().timestamp(),
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("LEGACY");
+    let (root, units) = f.build_sample_batch(1);
+    let legacy = crate::storage::LegacyBatch {
+        brand: f.brand.clone(),
+        merkle_root: root,
+        warranty_months: 12,
+        product_meta_hash: f.hash_str("META"),
+        unit_count: 1,
+        created_at: f.env.ledger().timestamp(),
+        recalled: false,
     };
     f.env.as_contract(&f.contract_id, || {
         f.env
             .storage()
             .persistent()
-            .set(&DataKey::Brand(f.brand.clone()), &legacy)
+            .set(&DataKey::Batch(f.brand.clone(), batch_id.clone()), &legacy);
     });
     assert_eq!(
-        f.client.get_brand_admin_config(&f.brand).unwrap().threshold,
-        1
+        f.client.get_batch(&f.brand, &batch_id).unwrap().expires_at,
+        None
     );
-    let action = BrandAction::RegisterServiceCenter(f.service_center.clone());
-    let id = f.client.propose_brand_action(&f.brand, &f.brand, &action);
-    assert!(f.client.get_brand_action(&f.brand, &id).unwrap().executed);
-    assert!(f.client.is_service_center(&f.brand, &f.service_center));
-    f.client.rotate_brand_admin(&f.brand, &f.alice);
-    assert_eq!(
-        f.client.get_brand_admin_config(&f.brand).unwrap().admins,
-        Vec::from_array(&f.env, [f.alice.clone()])
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
     );
-    assert_eq!(
-        f.client
-            .try_propose_brand_action(&f.brand, &f.brand, &action),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
+    f.client
+        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
+    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
 }
