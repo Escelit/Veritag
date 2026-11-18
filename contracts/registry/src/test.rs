@@ -8,7 +8,7 @@ use soroban_sdk::{
 };
 
 use crate::{
-    merkle::{compute_leaf, hash_pair, sha256_bytes, MAX_PROOF_DEPTH},
+    merkle::{compute_leaf, hash_pair, sha256_bytes, verify_proof, MAX_PROOF_DEPTH},
     storage::DataKey,
     types::{
         ClaimOutcome, RegistryError, UnitStatus, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
