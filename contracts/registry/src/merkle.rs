@@ -1,4 +1,4 @@
-use soroban_sdk::{xdr::ToXdr, Address, Bytes, BytesN, Env, Vec};
+use soroban_sdk::{xdr::ToXdr, Address, Bytes, BytesN, Env, EnvBase, TryFromVal, Val, Vec};
 
 /// Maximum supported Merkle proof depth (supports up to 2^32 units per batch).
 pub const MAX_PROOF_DEPTH: u32 = 32;
@@ -38,15 +38,17 @@ pub fn compute_leaf(env: &Env, serial_hash: &BytesN<32>, secret_hash: &BytesN<32
 /// Sorting sibling pairs eliminates the need to pass directional left/right index vectors
 /// alongside `proof: Vec<BytesN<32>>`.
 pub fn hash_pair(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
-    let a_arr = a.to_array();
-    let b_arr = b.to_array();
+    hash_pair_arrays(env, &a.to_array(), &b.to_array())
+}
+
+fn hash_pair_arrays(env: &Env, a: &[u8; 32], b: &[u8; 32]) -> BytesN<32> {
     let mut buf = [0u8; 64];
-    if a_arr <= b_arr {
-        buf[..32].copy_from_slice(&a_arr);
-        buf[32..].copy_from_slice(&b_arr);
+    if a <= b {
+        buf[..32].copy_from_slice(a);
+        buf[32..].copy_from_slice(b);
     } else {
-        buf[..32].copy_from_slice(&b_arr);
-        buf[32..].copy_from_slice(&a_arr);
+        buf[..32].copy_from_slice(b);
+        buf[32..].copy_from_slice(a);
     }
     let bytes = Bytes::from_array(env, &buf);
     sha256_bytes(env, &bytes)
@@ -59,13 +61,26 @@ pub fn verify_proof(
     leaf: &BytesN<32>,
     proof: &Vec<BytesN<32>>,
 ) -> bool {
-    if proof.len() > MAX_PROOF_DEPTH {
+    let depth = proof.len() as usize;
+    if depth > MAX_PROOF_DEPTH as usize {
         return false;
     }
-
-    let mut computed = leaf.clone();
-    for sibling in proof.iter() {
-        computed = hash_pair(env, &computed, &sibling);
+    if depth == 0 {
+        return leaf == merkle_root;
     }
-    computed == *merkle_root
+
+    // Copy the bounded proof's host handles once instead of cloning the Vec and
+    // invoking vec_get for every sibling. The same SDK primitive decodes tuples.
+    let mut siblings = [Val::VOID.to_val(); MAX_PROOF_DEPTH as usize];
+    env.vec_unpack_to_slice(proof.to_object(), &mut siblings[..depth])
+        .unwrap();
+
+    let mut computed = leaf.to_array();
+    for value in &siblings[..depth - 1] {
+        let sibling = <[u8; 32]>::try_from_val(env, value).unwrap();
+        computed = hash_pair_arrays(env, &computed, &sibling).to_array();
+    }
+    // Compare the final host hash directly to avoid copying it and the root.
+    let last_sibling = <[u8; 32]>::try_from_val(env, &siblings[depth - 1]).unwrap();
+    hash_pair_arrays(env, &computed, &last_sibling) == *merkle_root
 }
