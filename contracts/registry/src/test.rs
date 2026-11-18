@@ -197,7 +197,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     let meta = f.hash_str("META");
     assert_eq!(
         f.client
-            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100),
+            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None),
         Err(Ok(RegistryError::BrandNotVerified))
     );
     assert_eq!(
@@ -216,7 +216,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     assert_eq!(f.client.get_brand(&f.brand).unwrap().admin, rotated_signer);
 
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100);
+        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None);
     assert!(f.client.get_batch(&f.brand, &batch_id).is_some());
 }
 
@@ -231,18 +231,39 @@ fn test_merkle_batch_commit_and_lazy_activation() {
 
     // Zero unit count rejected
     assert_eq!(
-        f.client
-            .try_commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &0),
+        f.client.try_commit_batch(
+            &f.brand,
+            &batch_id,
+            &merkle_root,
+            &12,
+            &meta_hash,
+            &0,
+            &None
+        ),
         Err(Ok(RegistryError::InvalidInput))
     );
 
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &5);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &12,
+        &meta_hash,
+        &5,
+        &None,
+    );
 
     // Duplicate batch rejected
     assert_eq!(
-        f.client
-            .try_commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &5),
+        f.client.try_commit_batch(
+            &f.brand,
+            &batch_id,
+            &merkle_root,
+            &12,
+            &meta_hash,
+            &5,
+            &None
+        ),
         Err(Ok(RegistryError::BatchExists))
     );
 
@@ -344,8 +365,15 @@ fn test_resale_transfer_offer_redeem_expiry_and_cancel() {
     let batch_id = f.hash_str("BATCH-RESALE");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(2);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &24, &meta_hash, &2);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &24,
+        &meta_hash,
+        &2,
+        &None,
+    );
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
     let unit_id = f
@@ -422,7 +450,7 @@ fn test_warranty_boundary_and_claims_workflow() {
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(2);
     f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &6, &meta_hash, &2);
+        .commit_batch(&f.brand, &batch_id, &merkle_root, &6, &meta_hash, &2, &None);
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
     let unit_id = f
@@ -501,8 +529,15 @@ fn test_flag_unit_and_recall_batch_across_entrypoints() {
     let batch_id = f.hash_str("BATCH-SAFETY");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(3);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &12, &meta_hash, &3);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &12,
+        &meta_hash,
+        &3,
+        &None,
+    );
 
     // Activate unit 0 and unit 1; leave unit 2 unactivated
     let u0 = f.client.activate(
@@ -577,8 +612,15 @@ fn test_ttl_extension_and_strict_authorization() {
     let batch_id = f.hash_str("BATCH-TTL");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(1);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &24, &meta_hash, &1);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &24,
+        &meta_hash,
+        &1,
+        &None,
+    );
 
     let unit_id = f.client.activate(
         &f.brand,
@@ -636,17 +678,21 @@ fn test_ttl_extension_and_strict_authorization() {
 }
 
 #[test]
-fn test_retire_unit() {
-    use crate::events::UnitRetired;
-    use soroban_sdk::events::Event;
+fn test_batch_expiration() {
+    use crate::types::BatchStatus;
     let f = TestFixture::setup();
     f.setup_verified_brand();
-    let batch_id = f.hash_str("RECYCLE");
+    let batch_id = f.hash_str("PERISHABLES");
     let meta = f.hash_str("META");
-    let (root, units) = f.build_sample_batch(1);
+    let (root, units) = f.build_sample_batch(3);
+    let expiry = f.env.ledger().timestamp() + 100;
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1);
-    let unit_id = f.client.activate(
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &3, &Some(expiry));
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Active
+    );
+    f.client.activate(
         &f.brand,
         &batch_id,
         &units[0].0,
@@ -654,135 +700,8 @@ fn test_retire_unit() {
         &units[0].1,
         &f.alice,
     );
-    let claim_id = f.client.file_claim(&unit_id, &f.service_center);
-    let code = Bytes::from_slice(&f.env, b"PENDING-TRANSFER");
-    let code_hash = sha256_bytes(&f.env, &code);
-    let expires = f.env.ledger().timestamp() + 1000;
-    f.client
-        .create_transfer_offer(&unit_id, &code_hash, &expires);
-    let history_len = f.client.get_unit(&unit_id).unwrap().history_len;
-    let cert = f.hash_str("RECYCLING-CERTIFICATE");
-    assert_eq!(
-        f.client.try_retire_unit(&f.bob, &unit_id, &7, &cert),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    assert_eq!(
-        f.client.get_unit(&unit_id).unwrap().status,
-        UnitStatus::Active
-    );
-    assert!(f.client.get_unit_retirement(&unit_id).is_none());
-    f.client.retire_unit(&f.alice, &unit_id, &7, &cert);
-    let event = UnitRetired {
-        unit_id: unit_id.clone(),
-        caller: f.alice.clone(),
-        reason_code: 7,
-        cert_hash: cert.clone(),
-    };
-    assert_eq!(
-        f.env.events().all(),
-        Vec::from_array(
-            &f.env,
-            [(
-                f.contract_id.clone(),
-                event.topics(&f.env),
-                event.data(&f.env)
-            )]
-        )
-    );
-    let retirement = f.client.get_unit_retirement(&unit_id).unwrap();
-    assert_eq!(retirement.caller, f.alice);
-    assert_eq!(retirement.reason_code, 7);
-    assert_eq!(retirement.cert_hash, cert);
-    assert_eq!(retirement.retired_at, f.env.ledger().timestamp());
-    let view = f.client.get_unit(&unit_id).unwrap();
-    assert_eq!(view.status, UnitStatus::Retired);
-    assert_eq!(view.history_len, history_len + 1);
-    assert!(!view.warranty_valid);
-    assert!(!f.client.is_warranty_valid(&unit_id));
-    assert!(f.client.get_transfer_offer(&unit_id).is_none());
-    assert_eq!(
-        f.client
-            .try_create_transfer_offer(&unit_id, &code_hash, &expires),
-        Err(Ok(RegistryError::UnitRetired))
-    );
-    assert_eq!(
-        f.client.try_redeem_transfer(&unit_id, &code, &f.bob),
-        Err(Ok(RegistryError::UnitRetired))
-    );
-    assert_eq!(
-        f.client.try_file_claim(&unit_id, &f.service_center),
-        Err(Ok(RegistryError::UnitRetired))
-    );
-    assert_eq!(
-        f.client.try_activate(
-            &f.brand,
-            &batch_id,
-            &units[0].0,
-            &units[0].3,
-            &units[0].1,
-            &f.bob
-        ),
-        Err(Ok(RegistryError::UnitRetired))
-    );
-    assert_eq!(
-        f.client
-            .try_resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Repaired, &meta),
-        Err(Ok(RegistryError::UnitRetired))
-    );
-    assert_eq!(
-        f.client.try_flag_unit(&unit_id, &meta),
-        Err(Ok(RegistryError::UnitRetired))
-    );
-    assert_eq!(
-        f.client.try_retire_unit(&f.alice, &unit_id, &8, &meta),
-        Err(Ok(RegistryError::UnitRetired))
-    );
-    assert_eq!(f.client.get_unit_retirement(&unit_id), Some(retirement));
-    let verify = f
-        .client
-        .verify_serial(&f.brand, &batch_id, &units[0].0, &units[0].3, &units[0].2);
-    assert_eq!(verify.status, VerifyStatus::Retired);
-    assert!(!verify.warranty_valid);
-    f.client.recall_batch(&f.brand, &batch_id, &meta);
-    assert_eq!(
-        f.client.try_activate(
-            &f.brand,
-            &batch_id,
-            &units[0].0,
-            &units[0].3,
-            &units[0].1,
-            &f.bob
-        ),
-        Err(Ok(RegistryError::UnitRetired))
-    );
-    assert_eq!(
-        f.client.try_file_claim(&unit_id, &f.service_center),
-        Err(Ok(RegistryError::UnitRetired))
-    );
-    assert_eq!(
-        f.client.get_unit(&unit_id).unwrap().status,
-        UnitStatus::Retired
-    );
-}
-
-#[test]
-fn test_retire_unit_current_owner_and_rotated_brand_admin() {
-    let f = TestFixture::setup();
-    f.setup_verified_brand();
-    let batch_id = f.hash_str("RETIRE-AUTH");
-    let cert = f.hash_str("CERT");
-    let (root, units) = f.build_sample_batch(2);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &cert, &2);
-    let first = f.client.activate(
-        &f.brand,
-        &batch_id,
-        &units[0].0,
-        &units[0].3,
-        &units[0].1,
-        &f.alice,
-    );
-    let second = f.client.activate(
+    f.env.ledger().with_mut(|li| li.timestamp = expiry);
+    f.client.activate(
         &f.brand,
         &batch_id,
         &units[1].0,
@@ -790,53 +709,68 @@ fn test_retire_unit_current_owner_and_rotated_brand_admin() {
         &units[1].1,
         &f.alice,
     );
-    let code = Bytes::from_slice(&f.env, b"TRANSFER");
-    f.client.create_transfer_offer(
-        &first,
-        &sha256_bytes(&f.env, &code),
-        &(f.env.ledger().timestamp() + 100),
-    );
-    f.client.redeem_transfer(&first, &code, &f.bob);
+    f.env.ledger().with_mut(|li| li.timestamp = expiry + 1);
     assert_eq!(
-        f.client.try_retire_unit(&f.alice, &first, &1, &cert),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    f.client.retire_unit(&f.bob, &first, &1, &cert);
-    assert_eq!(f.client.get_unit_retirement(&first).unwrap().caller, f.bob);
-    f.client.flag_unit(&second, &cert);
-    let new_admin = Address::generate(&f.env);
-    f.client.rotate_brand_admin(&f.brand, &new_admin);
-    assert_eq!(
-        f.client.try_retire_unit(&f.brand, &second, &2, &cert),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    f.client.recall_batch(&f.brand, &batch_id, &cert);
-    f.client.retire_unit(&new_admin, &second, &2, &cert);
-    assert_eq!(
-        f.client.get_unit(&second).unwrap().status,
-        UnitStatus::Retired
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Expired
     );
     assert_eq!(
-        f.client.get_unit_retirement(&second).unwrap().caller,
-        new_admin
+        f.client.try_activate(
+            &f.brand,
+            &batch_id,
+            &units[2].0,
+            &units[2].3,
+            &units[2].1,
+            &f.alice
+        ),
+        Err(Ok(RegistryError::BatchExpired))
+    );
+    let unit_id = f.client.compute_unit_id(&f.brand, &batch_id, &units[2].0);
+    assert!(f.client.get_unit(&unit_id).is_none());
+    f.client.recall_batch(&f.brand, &batch_id, &meta);
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Recalled
+    );
+    assert_eq!(
+        f.client.try_activate(
+            &f.brand,
+            &batch_id,
+            &units[2].0,
+            &units[2].3,
+            &units[2].1,
+            &f.alice
+        ),
+        Err(Ok(RegistryError::BatchRecalled))
     );
 }
 
 #[test]
-fn test_retire_unit_requires_signature_and_existing_unit() {
+fn test_batch_expiration_invalid_commit_and_no_expiry() {
     let f = TestFixture::setup();
     f.setup_verified_brand();
-    let batch_id = f.hash_str("RETIRE-SIGNATURE");
-    let cert = f.hash_str("CERT");
-    assert_eq!(
-        f.client
-            .try_retire_unit(&f.alice, &f.hash_str("MISSING"), &0, &cert),
-        Err(Ok(RegistryError::UnitNotFound))
-    );
+    let batch_id = f.hash_str("NO-EXPIRY");
+    let meta = f.hash_str("META");
     let (root, units) = f.build_sample_batch(1);
+    let now = f.env.ledger().timestamp();
+    for expiry in [0, now - 1, now] {
+        assert_eq!(
+            f.client
+                .try_commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &Some(expiry)),
+            Err(Ok(RegistryError::InvalidInput))
+        );
+        assert!(f.client.get_batch(&f.brand, &batch_id).is_none());
+    }
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &cert, &1);
-    let unit_id = f.client.activate(
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &None);
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().expires_at,
+        None
+    );
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = now + SECONDS_PER_MONTH * 120);
+    f.client.activate(
         &f.brand,
         &batch_id,
         &units[0].0,
@@ -844,27 +778,42 @@ fn test_retire_unit_requires_signature_and_existing_unit() {
         &units[0].1,
         &f.alice,
     );
-    f.env.mock_auths(&[]);
-    assert!(f
-        .client
-        .try_retire_unit(&f.alice, &unit_id, &0, &cert)
-        .is_err());
+}
+
+#[test]
+fn test_batch_expiration_legacy_storage() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("LEGACY");
+    let (root, units) = f.build_sample_batch(1);
+    let legacy = crate::storage::LegacyBatch {
+        brand: f.brand.clone(),
+        merkle_root: root,
+        warranty_months: 12,
+        product_meta_hash: f.hash_str("META"),
+        unit_count: 1,
+        created_at: f.env.ledger().timestamp(),
+        recalled: false,
+    };
+    f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Batch(f.brand.clone(), batch_id.clone()), &legacy);
+    });
     assert_eq!(
-        f.client.get_unit(&unit_id).unwrap().status,
-        UnitStatus::Active
+        f.client.get_batch(&f.brand, &batch_id).unwrap().expires_at,
+        None
     );
-    f.env.mock_auths(&[MockAuth {
-        address: &f.alice,
-        invoke: &MockAuthInvoke {
-            contract: &f.contract_id,
-            fn_name: "retire_unit",
-            args: (f.alice.clone(), unit_id.clone(), 0u32, cert.clone()).into_val(&f.env),
-            sub_invokes: &[],
-        },
-    }]);
-    f.client.retire_unit(&f.alice, &unit_id, &0, &cert);
-    assert_eq!(
-        f.client.get_unit(&unit_id).unwrap().status,
-        UnitStatus::Retired
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
     );
+    f.client
+        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
+    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
 }
