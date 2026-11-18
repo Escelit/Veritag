@@ -296,6 +296,7 @@ impl VeritagRegistry {
             merkle_root: merkle_root.clone(),
             warranty_months,
             product_meta_hash,
+            metadata_cid: metadata_cid.clone(),
             unit_count,
             created_at: env.ledger().timestamp(),
             recalled: false,
@@ -311,6 +312,7 @@ impl VeritagRegistry {
             root: merkle_root,
             warranty_months,
             unit_count,
+            metadata_cid,
         }
         .publish(&env);
         Ok(())
@@ -734,6 +736,15 @@ impl VeritagRegistry {
 
     pub fn get_batch(env: Env, brand: Address, batch_id: BytesN<32>) -> Option<Batch> {
         storage::get_batch(&env, &brand, &batch_id)
+    }
+
+    /// Returns the immutable optional document digest for a committed batch.
+    pub fn get_batch_metadata_cid(
+        env: Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+    ) -> Option<BytesN<32>> {
+        storage::get_batch(&env, &brand, &batch_id).and_then(|batch| batch.metadata_cid)
     }
 
     pub fn get_unit(env: Env, unit_id: BytesN<32>) -> Option<UnitView> {

@@ -89,6 +89,7 @@ pub struct Batch {
     pub merkle_root: BytesN<32>,
     pub warranty_months: u32,
     pub product_meta_hash: BytesN<32>,
+    pub metadata_cid: Option<BytesN<32>>,
     pub unit_count: u64,
     pub created_at: u64,
     pub recalled: bool,

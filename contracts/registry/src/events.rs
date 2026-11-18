@@ -59,6 +59,7 @@ pub struct BatchCommitted {
     pub root: BytesN<32>,
     pub warranty_months: u32,
     pub unit_count: u64,
+    pub metadata_cid: Option<BytesN<32>>,
 }
 
 #[contractevent]

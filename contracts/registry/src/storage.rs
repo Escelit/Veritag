@@ -17,6 +17,19 @@ pub struct LegacyBatch {
     pub recalled: bool,
 }
 
+/// Storage layout used before optional document metadata was introduced.
+#[contracttype]
+#[derive(Clone)]
+pub struct LegacyBatch {
+    pub brand: Address,
+    pub merkle_root: BytesN<32>,
+    pub warranty_months: u32,
+    pub product_meta_hash: BytesN<32>,
+    pub unit_count: u64,
+    pub created_at: u64,
+    pub recalled: bool,
+}
+
 /// Approximate Stellar ledger close interval (~5 seconds per ledger).
 pub const SECONDS_PER_LEDGER: u64 = 5;
 pub const DAY_IN_LEDGERS: u32 = 17_280;
