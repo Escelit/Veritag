@@ -228,7 +228,8 @@ impl VeritagRegistry {
         storage::get_brand_action(&env, &brand, proposal_id)
     }
 
-    /// Authorizes a service center to resolve warranty claims for a verified brand.
+    /// Authorizes a service center, defaulting new centers to tier 3 for compatibility.
+    /// Reauthorization preserves its existing tier.
     pub fn register_service_center(
         env: Env,
         brand: Address,
@@ -236,14 +237,27 @@ impl VeritagRegistry {
     ) -> Result<(), RegistryError> {
         let brand_record = Self::require_verified_brand(&env, &brand)?;
         Self::require_single_brand_admin(&brand_record)?;
+        Self::register_service_center_internal(&env, brand, service_center)
+    }
 
-        storage::set_service_center(&env, &brand, &service_center, true);
+    fn register_service_center_internal(
+        env: &Env,
+        brand: Address,
+        service_center: Address,
+    ) -> Result<(), RegistryError> {
+        let mut record =
+            storage::get_service_center(env, &brand, &service_center).unwrap_or(ServiceCenter {
+                tier: 3,
+                active: true,
+            });
+        record.active = true;
+        storage::set_service_center(env, &brand, &service_center, &record);
         ServiceCenterRegistered {
             brand,
             service_center,
             authorized: true,
         }
-        .publish(&env);
+        .publish(env);
         Ok(())
     }
 
@@ -255,14 +269,67 @@ impl VeritagRegistry {
     ) -> Result<(), RegistryError> {
         let brand_record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
         Self::require_single_brand_admin(&brand_record)?;
+        Self::revoke_service_center_internal(&env, brand, service_center)
+    }
 
-        storage::set_service_center(&env, &brand, &service_center, false);
+    fn revoke_service_center_internal(
+        env: &Env,
+        brand: Address,
+        service_center: Address,
+    ) -> Result<(), RegistryError> {
+        let mut record = storage::get_service_center(env, &brand, &service_center)
+            .ok_or(RegistryError::ServiceCenterNotAuthorized)?;
+        record.active = false;
+        storage::set_service_center(env, &brand, &service_center, &record);
+        ServiceCenterRevoked {
+            brand: brand.clone(),
+            service_center: service_center.clone(),
+        }
+        .publish(env);
+        // Preserve the existing authorization event for indexer compatibility.
         ServiceCenterRegistered {
             brand,
             service_center,
             authorized: false,
         }
-        .publish(&env);
+        .publish(env);
+        Ok(())
+    }
+
+    /// Updates accreditation without reactivating a revoked center (brand admin only).
+    pub fn update_service_center_tier(
+        env: Env,
+        brand: Address,
+        service_center: Address,
+        new_tier: u32,
+    ) -> Result<(), RegistryError> {
+        if !(1..=3).contains(&new_tier) {
+            return Err(RegistryError::InvalidInput);
+        }
+        let brand_record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        Self::require_single_brand_admin(&brand_record)?;
+        Self::update_service_center_tier_internal(&env, brand, service_center, new_tier)
+    }
+
+    fn update_service_center_tier_internal(
+        env: &Env,
+        brand: Address,
+        service_center: Address,
+        new_tier: u32,
+    ) -> Result<(), RegistryError> {
+        if !(1..=3).contains(&new_tier) {
+            return Err(RegistryError::InvalidInput);
+        }
+        let mut record = storage::get_service_center(env, &brand, &service_center)
+            .ok_or(RegistryError::ServiceCenterNotAuthorized)?;
+        record.tier = new_tier;
+        storage::set_service_center(env, &brand, &service_center, &record);
+        ServiceCenterTierUpdated {
+            brand,
+            service_center,
+            new_tier,
+        }
+        .publish(env);
         Ok(())
     }
 
@@ -672,9 +739,8 @@ impl VeritagRegistry {
         }
         unit.owner.require_auth();
 
-        if !storage::is_service_center(&env, &unit.brand, &service_center) {
-            return Err(RegistryError::ServiceCenterNotAuthorized);
-        }
+        // Filing starts with inspection; settlement checks the actual outcome tier.
+        Self::require_service_center_tier(&env, &unit.brand, &service_center, 1)?;
 
         let now = env.ledger().timestamp();
         if now > unit.warranty_expiry {
@@ -732,9 +798,12 @@ impl VeritagRegistry {
             return Err(RegistryError::ClaimAlreadyResolved);
         }
 
-        if !storage::is_service_center(&env, &unit.brand, &claim.service_center) {
-            return Err(RegistryError::ServiceCenterNotAuthorized);
-        }
+        let required_tier = match outcome {
+            ClaimOutcome::Repaired => 2,
+            ClaimOutcome::Replaced => 3,
+            _ => 1,
+        };
+        Self::require_service_center_tier(&env, &unit.brand, &claim.service_center, required_tier)?;
         claim.service_center.require_auth();
 
         claim.outcome = outcome;
@@ -931,6 +1000,14 @@ impl VeritagRegistry {
 
     pub fn is_service_center(env: Env, brand: Address, service_center: Address) -> bool {
         storage::is_service_center(&env, &brand, &service_center)
+    }
+
+    pub fn get_service_center(
+        env: Env,
+        brand: Address,
+        service_center: Address,
+    ) -> Option<ServiceCenter> {
+        storage::get_service_center(&env, &brand, &service_center)
     }
 
     pub fn get_batch(env: Env, brand: Address, batch_id: BytesN<32>) -> Option<Batch> {
@@ -1240,6 +1317,17 @@ impl VeritagRegistry {
             BrandAction::RegisterServiceCenter(_) if !record.verified => {
                 return Err(RegistryError::BrandNotVerified)
             }
+            BrandAction::UpdateServiceCenterTier(center, tier) => {
+                if !(1..=3).contains(tier) {
+                    return Err(RegistryError::InvalidInput);
+                }
+                storage::get_service_center(env, brand, center)
+                    .ok_or(RegistryError::ServiceCenterNotAuthorized)?;
+            }
+            BrandAction::RevokeServiceCenter(center) => {
+                storage::get_service_center(env, brand, center)
+                    .ok_or(RegistryError::ServiceCenterNotAuthorized)?;
+            }
             BrandAction::ConfigureAdmins(config) => Self::validate_admin_config(config)?,
             _ => (),
         }
@@ -1269,16 +1357,19 @@ impl VeritagRegistry {
                 batch_id.clone(),
                 reason_hash.clone(),
             )?,
-            BrandAction::RegisterServiceCenter(center)
-            | BrandAction::RevokeServiceCenter(center) => {
-                let authorized = matches!(proposal.action, BrandAction::RegisterServiceCenter(_));
-                storage::set_service_center(env, brand, center, authorized);
-                ServiceCenterRegistered {
-                    brand: brand.clone(),
-                    service_center: center.clone(),
-                    authorized,
-                }
-                .publish(env);
+            BrandAction::RegisterServiceCenter(center) => {
+                Self::register_service_center_internal(env, brand.clone(), center.clone())?
+            }
+            BrandAction::RevokeServiceCenter(center) => {
+                Self::revoke_service_center_internal(env, brand.clone(), center.clone())?
+            }
+            BrandAction::UpdateServiceCenterTier(center, tier) => {
+                Self::update_service_center_tier_internal(
+                    env,
+                    brand.clone(),
+                    center.clone(),
+                    *tier,
+                )?
             }
             BrandAction::ConfigureAdmins(config) => {
                 Self::replace_brand_admins(env, brand, record, config.clone())?

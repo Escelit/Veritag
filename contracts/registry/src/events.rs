@@ -51,6 +51,25 @@ pub struct ServiceCenterRegistered {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceCenterRevoked {
+    #[topic]
+    pub brand: Address,
+    #[topic]
+    pub service_center: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceCenterTierUpdated {
+    #[topic]
+    pub brand: Address,
+    #[topic]
+    pub service_center: Address,
+    pub new_tier: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchCommitted {
     #[topic]
     pub brand: Address,
