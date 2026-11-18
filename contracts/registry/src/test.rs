@@ -1,6 +1,7 @@
 extern crate std;
 
 use soroban_sdk::{
+    events::Event,
     testutils::{
         storage::Persistent as _, Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke,
     },
@@ -8,11 +9,12 @@ use soroban_sdk::{
 };
 
 use crate::{
+    events::{ServiceCenterRegistered, ServiceCenterRevoked, ServiceCenterTierUpdated},
     merkle::{compute_leaf, hash_pair, sha256_bytes, MAX_PROOF_DEPTH},
     storage::DataKey,
     types::{
-        ClaimOutcome, RegistryError, UnitStatus, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
-        SECONDS_PER_MONTH,
+        ClaimOutcome, RegistryError, ServiceCenter, UnitStatus, VerifyStatus,
+        DEFAULT_MAX_CLAIMS_PER_UNIT, SECONDS_PER_MONTH,
     },
     VeritagRegistry, VeritagRegistryClient,
 };
@@ -1184,4 +1186,432 @@ fn test_merged_legacy_brand_governance() {
     assert!(!f.client.is_service_center(&f.brand, &f.service_center));
     assert!(f.client.approve_brand_action(&f.alice, &f.brand, &proposal));
     assert!(f.client.is_service_center(&f.brand, &f.service_center));
+}
+
+#[test]
+fn test_service_center_revocation() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("BATCH-REVOKE");
+    let (root, units) = f.build_sample_batch(1);
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &root, &1, &None, &None);
+    let unit_id = f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    let claim_id = f.client.file_claim(&unit_id, &f.service_center);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    f.client.revoke_service_center(&f.brand, &f.service_center);
+    assert_eq!(
+        f.env.events().all(),
+        [
+            ServiceCenterRevoked {
+                brand: f.brand.clone(),
+                service_center: f.service_center.clone()
+            }
+            .to_xdr(&f.env, &f.contract_id),
+            ServiceCenterRegistered {
+                brand: f.brand.clone(),
+                service_center: f.service_center.clone(),
+                authorized: false,
+            }
+            .to_xdr(&f.env, &f.contract_id),
+        ]
+    );
+    assert!(!f.client.is_service_center(&f.brand, &f.service_center));
+    assert_eq!(
+        f.client.get_service_center(&f.brand, &f.service_center),
+        Some(ServiceCenter {
+            tier: 3,
+            active: false
+        })
+    );
+    assert_eq!(
+        f.client.try_file_claim(&unit_id, &f.service_center),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    assert_eq!(
+        f.client
+            .try_resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Replaced, &root),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    assert_eq!(
+        f.client.get_claim(&unit_id, &claim_id).unwrap().outcome,
+        ClaimOutcome::Pending
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+
+    // Accreditation changes cannot silently restore a revoked authorization.
+    f.client
+        .update_service_center_tier(&f.brand, &f.service_center, &2);
+    assert_eq!(
+        f.env.events().all(),
+        [ServiceCenterTierUpdated {
+            brand: f.brand.clone(),
+            service_center: f.service_center.clone(),
+            new_tier: 2,
+        }
+        .to_xdr(&f.env, &f.contract_id)]
+    );
+    assert_eq!(
+        f.client.try_file_claim(&unit_id, &f.service_center),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    assert_eq!(
+        f.client
+            .try_resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Repaired, &root),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+
+    f.client
+        .register_service_center(&f.brand, &f.service_center);
+    assert_eq!(
+        f.client.get_service_center(&f.brand, &f.service_center),
+        Some(ServiceCenter {
+            tier: 2,
+            active: true
+        })
+    );
+    f.client
+        .resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Repaired, &root);
+    assert_eq!(
+        f.client.get_claim(&unit_id, &claim_id).unwrap().outcome,
+        ClaimOutcome::Repaired
+    );
+    assert_eq!(f.client.file_claim(&unit_id, &f.service_center), 2);
+}
+
+#[test]
+fn test_service_center_accreditation_tiers() {
+    for tier in 1..=3 {
+        let f = TestFixture::setup();
+        f.setup_verified_brand();
+        let batch_id = f.hash_str("BATCH-TIERS");
+        let (root, units) = f.build_sample_batch(1);
+        f.client
+            .commit_batch(&f.brand, &batch_id, &root, &12, &root, &1, &None, &None);
+        let unit_id = f.client.activate(
+            &f.brand,
+            &batch_id,
+            &units[0].0,
+            &units[0].3,
+            &units[0].1,
+            &f.alice,
+        );
+        f.client
+            .update_service_center_tier(&f.brand, &f.service_center, &tier);
+        for (outcome, required_tier) in [
+            (ClaimOutcome::Approved, 1),
+            (ClaimOutcome::Rejected, 1),
+            (ClaimOutcome::Repaired, 2),
+            (ClaimOutcome::Replaced, 3),
+        ] {
+            let claim_id = f.client.file_claim(&unit_id, &f.service_center);
+            let before = f.client.get_unit(&unit_id).unwrap();
+            if tier >= required_tier {
+                f.client.resolve_claim(&unit_id, &claim_id, &outcome, &root);
+                assert_eq!(
+                    f.client.get_claim(&unit_id, &claim_id).unwrap().outcome,
+                    outcome
+                );
+            } else {
+                assert_eq!(
+                    f.client
+                        .try_resolve_claim(&unit_id, &claim_id, &outcome, &root),
+                    Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+                );
+                assert_eq!(
+                    f.client.get_claim(&unit_id, &claim_id).unwrap().outcome,
+                    ClaimOutcome::Pending
+                );
+                assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_service_center_tier_downgrade_and_validation() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("BATCH-DOWNGRADE");
+    let (root, units) = f.build_sample_batch(1);
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &root, &1, &None, &None);
+    let unit_id = f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    let claim_id = f.client.file_claim(&unit_id, &f.service_center);
+    for invalid in [0, 4, u32::MAX] {
+        assert_eq!(
+            f.client
+                .try_update_service_center_tier(&f.brand, &f.service_center, &invalid),
+            Err(Ok(RegistryError::InvalidInput))
+        );
+        assert_eq!(
+            f.client
+                .get_service_center(&f.brand, &f.service_center)
+                .unwrap()
+                .tier,
+            3
+        );
+    }
+    f.client
+        .update_service_center_tier(&f.brand, &f.service_center, &1);
+    assert_eq!(
+        f.client
+            .try_resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Replaced, &root),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    f.client
+        .update_service_center_tier(&f.brand, &f.service_center, &3);
+    f.client
+        .resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Replaced, &root);
+    assert_eq!(
+        f.client.get_unit(&unit_id).unwrap().status,
+        UnitStatus::Retired
+    );
+
+    assert_eq!(
+        f.client
+            .try_update_service_center_tier(&f.brand, &f.bob, &1),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    assert_eq!(
+        f.client.try_revoke_service_center(&f.brand, &f.bob),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    assert_eq!(
+        f.client
+            .try_update_service_center_tier(&f.bob, &f.service_center, &1),
+        Err(Ok(RegistryError::BrandNotFound))
+    );
+    assert_eq!(
+        f.client
+            .try_revoke_service_center(&f.bob, &f.service_center),
+        Err(Ok(RegistryError::BrandNotFound))
+    );
+}
+
+#[test]
+fn test_service_center_legacy_records_and_brand_scope() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let legacy_center = Address::generate(&f.env);
+    f.env.as_contract(&f.contract_id, || {
+        f.env.storage().persistent().set(
+            &DataKey::ServiceCenter(f.brand.clone(), legacy_center.clone()),
+            &true,
+        );
+    });
+    assert_eq!(
+        f.client.get_service_center(&f.brand, &legacy_center),
+        Some(ServiceCenter {
+            tier: 3,
+            active: true
+        })
+    );
+    f.client
+        .update_service_center_tier(&f.brand, &legacy_center, &1);
+    assert_eq!(
+        f.client
+            .get_service_center(&f.brand, &legacy_center)
+            .unwrap()
+            .tier,
+        1
+    );
+    f.client.revoke_service_center(&f.brand, &legacy_center);
+    assert!(!f.client.is_service_center(&f.brand, &legacy_center));
+
+    f.client
+        .register_brand(&f.bob, &String::from_str(&f.env, "another-brand.example"));
+    f.client.verify_brand(&f.bob);
+    let batch_id = f.hash_str("BATCH-OTHER-BRAND");
+    let (root, units) = f.build_sample_batch(1);
+    f.client
+        .commit_batch(&f.bob, &batch_id, &root, &12, &root, &1, &None, &None);
+    let unit_id = f.client.activate(
+        &f.bob,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    assert_eq!(
+        f.client.try_file_claim(&unit_id, &f.service_center),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    f.client.register_service_center(&f.bob, &f.service_center);
+    let claim_id = f.client.file_claim(&unit_id, &f.service_center);
+    f.client.revoke_service_center(&f.brand, &f.service_center);
+    f.client
+        .resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Repaired, &root);
+}
+
+#[test]
+fn test_service_center_admin_authorization() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    f.client.rotate_brand_admin(&f.brand, &f.bob);
+    for method in ["update_service_center_tier", "revoke_service_center"] {
+        let args: Vec<soroban_sdk::Val> = if method == "update_service_center_tier" {
+            (f.brand.clone(), f.service_center.clone(), 1u32).into_val(&f.env)
+        } else {
+            (f.brand.clone(), f.service_center.clone()).into_val(&f.env)
+        };
+        for signer in [&f.alice, &f.brand] {
+            f.env.mock_auths(&[MockAuth {
+                address: signer,
+                invoke: &MockAuthInvoke {
+                    contract: &f.contract_id,
+                    fn_name: method,
+                    args: args.clone(),
+                    sub_invokes: &[],
+                },
+            }]);
+            let result = if method == "update_service_center_tier" {
+                f.client
+                    .try_update_service_center_tier(&f.brand, &f.service_center, &1)
+            } else {
+                f.client
+                    .try_revoke_service_center(&f.brand, &f.service_center)
+            };
+            assert!(result.is_err());
+            assert!(
+                f.client
+                    .get_service_center(&f.brand, &f.service_center)
+                    .unwrap()
+                    .active
+            );
+        }
+        f.env.mock_auths(&[MockAuth {
+            address: &f.bob,
+            invoke: &MockAuthInvoke {
+                contract: &f.contract_id,
+                fn_name: method,
+                args,
+                sub_invokes: &[],
+            },
+        }]);
+        if method == "update_service_center_tier" {
+            f.client
+                .update_service_center_tier(&f.brand, &f.service_center, &1);
+        } else {
+            f.client.revoke_service_center(&f.brand, &f.service_center);
+        }
+    }
+}
+
+#[test]
+fn test_service_center_multisig_actions() {
+    use crate::types::{BrandAction, BrandAdminConfig};
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("MULTISIG-SERVICE-CENTER");
+    let (root, units) = f.build_sample_batch(1);
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &root, &1, &None, &None);
+    let unit_id = f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    let claim_id = f.client.file_claim(&unit_id, &f.service_center);
+    f.client.configure_brand_admins(
+        &f.brand,
+        &BrandAdminConfig {
+            admins: Vec::from_array(&f.env, [f.brand.clone(), f.bob.clone()]),
+            threshold: 2,
+        },
+    );
+    assert_eq!(
+        f.client
+            .try_revoke_service_center(&f.brand, &f.service_center),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert_eq!(
+        f.client
+            .try_update_service_center_tier(&f.brand, &f.service_center, &1),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert_eq!(
+        f.client.try_register_service_center(&f.brand, &f.alice),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    let action = BrandAction::RevokeServiceCenter(f.service_center.clone());
+    let proposal = f.client.propose_brand_action(&f.brand, &f.brand, &action);
+    assert!(f.client.is_service_center(&f.brand, &f.service_center));
+    assert_eq!(
+        f.client
+            .try_approve_brand_action(&f.alice, &f.brand, &proposal),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &proposal));
+    assert!(!f.client.is_service_center(&f.brand, &f.service_center));
+    assert_eq!(
+        f.client.try_file_claim(&unit_id, &f.service_center),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    assert_eq!(
+        f.client
+            .try_resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Repaired, &root),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    for tier in [0, 4, u32::MAX] {
+        assert_eq!(
+            f.client.try_propose_brand_action(
+                &f.brand,
+                &f.brand,
+                &BrandAction::UpdateServiceCenterTier(f.service_center.clone(), tier)
+            ),
+            Err(Ok(RegistryError::InvalidInput))
+        );
+    }
+    let proposal = f.client.propose_brand_action(
+        &f.brand,
+        &f.brand,
+        &BrandAction::UpdateServiceCenterTier(f.service_center.clone(), 1),
+    );
+    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &proposal));
+    assert_eq!(
+        f.client.get_service_center(&f.brand, &f.service_center),
+        Some(ServiceCenter {
+            active: false,
+            tier: 1
+        })
+    );
+    let proposal = f.client.propose_brand_action(
+        &f.brand,
+        &f.brand,
+        &BrandAction::RegisterServiceCenter(f.service_center.clone()),
+    );
+    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &proposal));
+    assert_eq!(
+        f.client.get_service_center(&f.brand, &f.service_center),
+        Some(ServiceCenter {
+            active: true,
+            tier: 1
+        })
+    );
+    assert_eq!(
+        f.client
+            .try_resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Repaired, &root),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    f.client
+        .resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Approved, &root);
 }

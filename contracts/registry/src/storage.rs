@@ -3,8 +3,8 @@ use soroban_sdk::{
 };
 
 use crate::types::{
-    Batch, BatchStatus, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, TransferOffer,
-    Unit, UnitRetirement, SECONDS_PER_MONTH,
+    Batch, BatchStatus, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, ServiceCenter,
+    TransferOffer, Unit, UnitRetirement, SECONDS_PER_MONTH,
 };
 
 /// Storage layout used before optional expiration was introduced.
@@ -191,18 +191,35 @@ pub fn set_brand(env: &Env, brand_addr: &Address, brand: &Brand) {
 // --- Service Center ---
 
 pub fn is_service_center(env: &Env, brand: &Address, service_center: &Address) -> bool {
-    let key = DataKey::ServiceCenter(brand.clone(), service_center.clone());
-    env.storage().persistent().get(&key).unwrap_or(false)
+    get_service_center(env, brand, service_center)
+        .map(|record| record.active && (1..=3).contains(&record.tier))
+        .unwrap_or(false)
 }
 
-pub fn set_service_center(env: &Env, brand: &Address, service_center: &Address, authorized: bool) {
+pub fn get_service_center(
+    env: &Env,
+    brand: &Address,
+    service_center: &Address,
+) -> Option<ServiceCenter> {
     let key = DataKey::ServiceCenter(brand.clone(), service_center.clone());
-    if authorized {
-        env.storage().persistent().set(&key, &true);
-        extend_persistent_baseline(env, &key);
-    } else if env.storage().persistent().has(&key) {
-        env.storage().persistent().remove(&key);
-    }
+    let value: Val = env.storage().persistent().get(&key)?;
+    ServiceCenter::try_from_val(env, &value).ok().or_else(|| {
+        // Existing boolean authorizations retain their original full privileges.
+        bool::try_from_val(env, &value)
+            .ok()
+            .map(|active| ServiceCenter { tier: 3, active })
+    })
+}
+
+pub fn set_service_center(
+    env: &Env,
+    brand: &Address,
+    service_center: &Address,
+    record: &ServiceCenter,
+) {
+    let key = DataKey::ServiceCenter(brand.clone(), service_center.clone());
+    env.storage().persistent().set(&key, record);
+    extend_persistent_baseline(env, &key);
 }
 
 // --- Batch ---

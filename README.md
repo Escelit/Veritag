@@ -280,6 +280,8 @@ init(admin)
 register_brand(brand, domain)                          // brand auth
 verify_brand(brand)                                    // registry admin only
 register_service_center(brand, service_center)         // brand auth
+revoke_service_center(brand, service_center)           // brand auth
+update_service_center_tier(brand, service_center, new_tier) // brand auth, tier 1..=3
 
 // Production
 commit_batch(brand, batch_id, merkle_root,
@@ -301,6 +303,7 @@ recall_batch(brand, batch_id, reason_hash)             // brand auth
 
 // Reads
 get_brand(brand)
+get_service_center(brand, service_center) -> Option<ServiceCenter>
 get_batch(brand, batch_id)
 get_unit(unit_id) -> Option<UnitView>
 verify_serial(brand, batch_id, serial_hash, proof, secret_hash) -> VerifyResult
@@ -315,6 +318,8 @@ Every state change emits an event so the indexer can rebuild history:
 |---|---|---|
 | `brand_registered` | brand | domain |
 | `brand_verified` | brand | |
+| `service_center_revoked` | brand, service_center | |
+| `service_center_tier_updated` | brand, service_center | new_tier |
 | `batch_committed` | brand, batch_id | root, warranty_months, unit_count |
 | `unit_activated` | unit_id | owner, warranty_expiry |
 | `duplicate_attempt` | unit_id | caller |

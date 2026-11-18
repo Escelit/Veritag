@@ -73,6 +73,7 @@ pub enum BrandAction {
     RecallBatch(BytesN<32>, BytesN<32>),
     RegisterServiceCenter(Address),
     RevokeServiceCenter(Address),
+    UpdateServiceCenterTier(Address, u32),
     ConfigureAdmins(BrandAdminConfig),
 }
 
@@ -84,6 +85,14 @@ pub struct BrandActionProposal {
     pub approvals: Vec<Address>,
     pub admin_generation: u32,
     pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceCenter {
+    /// 1: inspection; 2: repair; 3: full replacement.
+    pub tier: u32,
+    pub active: bool,
 }
 
 #[contracttype]
