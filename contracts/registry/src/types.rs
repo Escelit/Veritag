@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address, BytesN, String};
+use soroban_sdk::{contracterror, contracttype, Address, BytesN, String, Vec};
 
 /// Default maximum warranty claims allowed per unit unless overridden.
 pub const DEFAULT_MAX_CLAIMS_PER_UNIT: u32 = 5;
@@ -51,6 +51,35 @@ pub struct Brand {
     pub domain: String,
     pub verified: bool,
     pub registered_at: u64,
+    pub admin_config: BrandAdminConfig,
+    pub admin_generation: u32,
+    pub next_action_id: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrandAdminConfig {
+    pub admins: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrandAction {
+    RecallBatch(BytesN<32>, BytesN<32>),
+    RegisterServiceCenter(Address),
+    RevokeServiceCenter(Address),
+    ConfigureAdmins(BrandAdminConfig),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrandActionProposal {
+    pub action: BrandAction,
+    pub caller: Address,
+    pub approvals: Vec<Address>,
+    pub admin_generation: u32,
+    pub executed: bool,
 }
 
 #[contracttype]
