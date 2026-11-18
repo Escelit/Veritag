@@ -3,7 +3,7 @@ use soroban_sdk::{
 };
 
 use crate::types::{
-    Batch, BatchStatus, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, ServiceCenter,
+    Batch, BatchStatus, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, RecallInfo,
     TransferOffer, Unit, UnitRetirement, SECONDS_PER_MONTH,
 };
 
@@ -56,6 +56,7 @@ pub enum DataKey {
     BrandAction(Address, u32),
     ServiceCenter(Address, Address),
     Batch(Address, BytesN<32>),
+    BatchRecallInfo(Address, BytesN<32>),
     Unit(BytesN<32>),
     UnitRetirement(BytesN<32>),
     Offer(BytesN<32>),
@@ -116,6 +117,17 @@ pub fn extend_batch_ttl(env: &Env, key: &DataKey, warranty_months: u32) {
         env.storage()
             .persistent()
             .extend_ttl(key, clamped_threshold, clamped_extend);
+        // Keep recall metadata available for as long as the batch itself.
+        if let DataKey::Batch(brand, batch_id) = key {
+            let recall_key = DataKey::BatchRecallInfo(brand.clone(), batch_id.clone());
+            if env.storage().persistent().has(&recall_key) {
+                env.storage().persistent().extend_ttl(
+                    &recall_key,
+                    clamped_threshold,
+                    clamped_extend,
+                );
+            }
+        }
     }
 }
 
@@ -249,6 +261,10 @@ pub fn get_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> Option<Ba
     if !fields.contains_key(status_key.clone()) {
         fields.set(status_key, BatchStatus::Active.into_val(env));
     }
+    let frozen_key = Symbol::new(env, "frozen");
+    if !fields.contains_key(frozen_key.clone()) {
+        fields.set(frozen_key, false.into_val(env));
+    }
     let normalized: Val = fields.into_val(env);
     let mut batch = Batch::try_from_val(env, &normalized).expect("invalid batch storage");
     // Time advances without a transaction. Derive the effective status on every read.
@@ -271,6 +287,30 @@ pub fn set_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>, batch: &Batc
     extend_batch_ttl(env, &key, batch.warranty_months);
 }
 
+// --- Recall metadata ---
+
+pub fn get_batch_recall_info(
+    env: &Env,
+    brand: &Address,
+    batch_id: &BytesN<32>,
+) -> Option<RecallInfo> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BatchRecallInfo(brand.clone(), batch_id.clone()))
+}
+
+pub fn set_batch_recall_info(
+    env: &Env,
+    brand: &Address,
+    batch_id: &BytesN<32>,
+    info: &RecallInfo,
+    warranty_months: u32,
+) {
+    let key = DataKey::BatchRecallInfo(brand.clone(), batch_id.clone());
+    env.storage().persistent().set(&key, info);
+    extend_batch_ttl(env, &key, warranty_months);
+}
+
 // --- Unit ---
 
 pub fn has_unit(env: &Env, unit_id: &BytesN<32>) -> bool {
@@ -280,9 +320,17 @@ pub fn has_unit(env: &Env, unit_id: &BytesN<32>) -> bool {
 }
 
 pub fn get_unit(env: &Env, unit_id: &BytesN<32>) -> Option<Unit> {
-    env.storage()
+    let value: Val = env
+        .storage()
         .persistent()
-        .get(&DataKey::Unit(unit_id.clone()))
+        .get(&DataKey::Unit(unit_id.clone()))?;
+    let mut fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid unit storage");
+    let timestamp_key = Symbol::new(env, "last_transferred_at");
+    if !fields.contains_key(timestamp_key.clone()) {
+        fields.set(timestamp_key, 0u64.into_val(env));
+    }
+    let normalized: Val = fields.into_val(env);
+    Some(Unit::try_from_val(env, &normalized).expect("invalid unit storage"))
 }
 
 pub fn set_unit(env: &Env, unit_id: &BytesN<32>, unit: &Unit) {

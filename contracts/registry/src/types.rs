@@ -38,7 +38,8 @@ pub enum RegistryError {
     InvalidInput = 22,
     UnitRetired = 23,
     BatchExpired = 24,
-    WarrantyLimitReached = 25,
+    BatchFrozen = 25,
+    WarrantyLimitReached = 26,
 }
 
 #[contracttype]
@@ -70,6 +71,8 @@ pub struct BrandAdminConfig {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrandAction {
+    FreezeBatch(BytesN<32>),
+    UnfreezeBatch(BytesN<32>),
     RecallBatch(BytesN<32>, BytesN<32>),
     RegisterServiceCenter(Address),
     RevokeServiceCenter(Address),
@@ -101,11 +104,14 @@ pub struct Batch {
     pub brand: Address,
     pub merkle_root: BytesN<32>,
     pub warranty_months: u32,
+    /// None allows transfers without a batch cap; Some(0) disables transfers.
+    pub max_transfers: Option<u32>,
     pub product_meta_hash: BytesN<32>,
     pub metadata_cid: Option<BytesN<32>>,
     pub unit_count: u64,
     pub created_at: u64,
     pub recalled: bool,
+    pub frozen: bool,
     pub expires_at: Option<u64>,
     pub status: BatchStatus,
 }
@@ -116,6 +122,16 @@ pub enum BatchStatus {
     Active,
     Expired,
     Recalled,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecallInfo {
+    /// 1: critical/life safety; 2: functional defect; 3: cosmetic/labeling.
+    /// Soroban represents small unsigned integers as u32 in its contract ABI.
+    pub severity: u32,
+    pub notice_hash: BytesN<32>,
+    pub recalled_at: u64,
 }
 
 #[contracttype]
@@ -143,7 +159,9 @@ pub struct Unit {
     pub batch_id: BytesN<32>,
     pub owner: Address,
     pub status: UnitStatus,
+    pub transfer_count: u32,
     pub activated_at: u64,
+    pub last_transferred_at: u64,
     pub warranty_expiry: u64,
     pub claims_used: u32,
     pub history_len: u32,
@@ -158,6 +176,7 @@ pub struct UnitView {
     pub batch_id: BytesN<32>,
     pub owner: Address,
     pub status: UnitStatus,
+    pub transfer_count: u32,
     pub activated_at: u64,
     pub warranty_expiry: u64,
     pub warranty_valid: bool,

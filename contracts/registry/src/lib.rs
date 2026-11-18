@@ -8,14 +8,14 @@ pub mod types;
 use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
 use crate::events::{
-    BatchCommitted, BatchRecalled, BrandActionExecuted, BrandActionProposed, BrandRegistered,
-    BrandVerified, ClaimFiled, ClaimResolved, DuplicateAttempt, ServiceCenterRegistered,
-    ServiceCenterRevoked, ServiceCenterTierUpdated, TransferCancelled, TransferOffered,
-    UnitActivated, UnitFlagged, UnitRetired, UnitTransferred, WarrantyExtended,
+    BatchCommitted, BatchFrozen, BatchRecalled, BatchUnfrozen, BrandActionExecuted,
+    BrandActionProposed, BrandRegistered, BrandVerified, ClaimFiled, ClaimResolved,
+    DuplicateAttempt, ServiceCenterRegistered, TransferCancelled, TransferOffered, UnitActivated,
+    UnitFlagged, UnitRetired, UnitTransferred, WarrantyExtended,
 };
 use crate::types::{
     Batch, BatchStatus, Brand, BrandAction, BrandActionProposal, BrandAdminConfig, Claim,
-    ClaimOutcome, Config, RegistryError, ServiceCenter, TransferOffer, Unit, UnitRetirement,
+    ClaimOutcome, Config, RecallInfo, RegistryError, TransferOffer, Unit, UnitRetirement,
     UnitStatus, UnitView, VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
     MAX_WARRANTY_MONTHS, SECONDS_PER_MONTH,
 };
@@ -365,11 +365,13 @@ impl VeritagRegistry {
             brand: brand.clone(),
             merkle_root: merkle_root.clone(),
             warranty_months,
+            max_transfers: None,
             product_meta_hash,
             metadata_cid: metadata_cid.clone(),
             unit_count,
             created_at: env.ledger().timestamp(),
             recalled: false,
+            frozen: false,
             expires_at,
             status: BatchStatus::Active,
         };
@@ -383,6 +385,30 @@ impl VeritagRegistry {
             warranty_months,
             unit_count,
             metadata_cid,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Sets a batch's custody transfer cap (brand admin only).
+    /// None removes the cap; Some(0) disables transfers without resetting unit counters.
+    pub fn set_max_transfers(
+        env: Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+        max_transfers: Option<u32>,
+    ) -> Result<(), RegistryError> {
+        let brand_record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        brand_record.admin.require_auth();
+        let mut batch =
+            storage::get_batch(&env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
+        batch.max_transfers = max_transfers;
+        storage::set_batch(&env, &brand, &batch_id, &batch);
+        storage::extend_instance_ttl(&env);
+        BatchTransferLimitUpdated {
+            brand,
+            batch_id,
+            max_transfers,
         }
         .publish(&env);
         Ok(())
@@ -415,6 +441,9 @@ impl VeritagRegistry {
         if batch.recalled {
             return Err(RegistryError::BatchRecalled);
         }
+        if batch.frozen {
+            return Err(RegistryError::BatchFrozen);
+        }
         if batch.status == BatchStatus::Expired {
             return Err(RegistryError::BatchExpired);
         }
@@ -443,7 +472,9 @@ impl VeritagRegistry {
             batch_id: batch_id.clone(),
             owner: first_owner.clone(),
             status: UnitStatus::Active,
+            transfer_count: 0,
             activated_at: now,
+            last_transferred_at: 0,
             warranty_expiry,
             claims_used: 0,
             history_len: 1,
@@ -554,8 +585,14 @@ impl VeritagRegistry {
         let mut unit = storage::get_unit(&env, &unit_id).ok_or(RegistryError::UnitNotFound)?;
         Self::ensure_unit_operational(&env, &unit)?;
         unit.owner.require_auth();
+        Self::ensure_transfer_limit(&env, &unit)?;
 
         let now = env.ledger().timestamp();
+        // Subtract rather than adding to last_transferred_at so the cooldown
+        // cannot wrap near u64::MAX or be bypassed by an earlier timestamp.
+        if now.saturating_sub(unit.last_transferred_at) < TRANSFER_COOLDOWN_SECONDS {
+            return Err(RegistryError::TransferCooldownActive);
+        }
         if expires_at <= now {
             return Err(RegistryError::InvalidInput);
         }
@@ -590,6 +627,8 @@ impl VeritagRegistry {
 
         let mut unit = storage::get_unit(&env, &unit_id).ok_or(RegistryError::UnitNotFound)?;
         Self::ensure_unit_operational(&env, &unit)?;
+        // A brand may have lowered the cap since the owner created this offer.
+        Self::ensure_transfer_limit(&env, &unit)?;
 
         let offer =
             storage::get_offer(&env, &unit_id).ok_or(RegistryError::TransferOfferNotFound)?;
@@ -604,6 +643,7 @@ impl VeritagRegistry {
 
         let previous_owner = unit.owner.clone();
         unit.owner = new_owner.clone();
+        unit.last_transferred_at = env.ledger().timestamp();
         unit.history_len = unit.history_len.saturating_add(1);
 
         storage::remove_offer(&env, &unit_id);
@@ -614,6 +654,7 @@ impl VeritagRegistry {
             unit_id,
             from: previous_owner,
             to: new_owner,
+            transfer_count: unit.transfer_count,
         }
         .publish(&env);
         Ok(())
@@ -692,7 +733,10 @@ impl VeritagRegistry {
     ) -> Result<u32, RegistryError> {
         let config = storage::get_config(&env).ok_or(RegistryError::NotInitialized)?;
         let mut unit = storage::get_unit(&env, &unit_id).ok_or(RegistryError::UnitNotFound)?;
-        Self::ensure_unit_operational(&env, &unit)?;
+        let batch = Self::ensure_unit_operational(&env, &unit)?;
+        if batch.frozen {
+            return Err(RegistryError::BatchFrozen);
+        }
         unit.owner.require_auth();
 
         // Filing starts with inspection; settlement checks the actual outcome tier.
@@ -789,6 +833,51 @@ impl VeritagRegistry {
     // Safety, Anti-Counterfeit Flags & Recalls
     // -------------------------------------------------------------------------
 
+    /// Temporarily suspends activations and new warranty claims (brand admin only).
+    pub fn freeze_batch(
+        env: Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+    ) -> Result<(), RegistryError> {
+        let record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        Self::require_single_brand_admin(&record)?;
+        Self::set_batch_frozen_internal(&env, brand, batch_id, true)
+    }
+
+    /// Clears a temporary suspension without reversing a permanent recall (brand admin only).
+    pub fn unfreeze_batch(
+        env: Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+    ) -> Result<(), RegistryError> {
+        let record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        Self::require_single_brand_admin(&record)?;
+        Self::set_batch_frozen_internal(&env, brand, batch_id, false)
+    }
+
+    fn set_batch_frozen_internal(
+        env: &Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+        frozen: bool,
+    ) -> Result<(), RegistryError> {
+        let mut batch =
+            storage::get_batch(env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
+        if batch.recalled {
+            return Err(RegistryError::BatchRecalled);
+        }
+        if batch.frozen != frozen {
+            batch.frozen = frozen;
+            storage::set_batch(env, &brand, &batch_id, &batch);
+            if frozen {
+                BatchFrozen { brand, batch_id }.publish(env);
+            } else {
+                BatchUnfrozen { brand, batch_id }.publish(env);
+            }
+        }
+        Ok(())
+    }
+
     /// Flags an individual unit as compromised, stolen, or counterfeit (brand admin only).
     pub fn flag_unit(
         env: Env,
@@ -814,35 +903,51 @@ impl VeritagRegistry {
         Ok(())
     }
 
-    /// Recalls an entire production batch immediately (brand admin only).
+    /// Recalls a batch with a severity tier (1..=3) and regulatory notice digest (brand admin only).
     pub fn recall_batch(
         env: Env,
         brand: Address,
         batch_id: BytesN<32>,
-        reason_hash: BytesN<32>,
+        severity: u32,
+        notice_hash: BytesN<32>,
     ) -> Result<(), RegistryError> {
+        if !(1..=3).contains(&severity) {
+            return Err(RegistryError::InvalidInput);
+        }
         let brand_record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
         Self::require_single_brand_admin(&brand_record)?;
 
-        Self::recall_batch_internal(&env, brand, batch_id, reason_hash)
+        Self::recall_batch_internal(&env, brand, batch_id, severity, notice_hash)
     }
 
     fn recall_batch_internal(
         env: &Env,
         brand: Address,
         batch_id: BytesN<32>,
-        reason_hash: BytesN<32>,
+        severity: u32,
+        notice_hash: BytesN<32>,
     ) -> Result<(), RegistryError> {
+        if !(1..=3).contains(&severity) {
+            return Err(RegistryError::InvalidInput);
+        }
         let mut batch =
             storage::get_batch(env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         batch.recalled = true;
         batch.status = BatchStatus::Recalled;
+        let info = RecallInfo {
+            severity,
+            notice_hash: notice_hash.clone(),
+            recalled_at: env.ledger().timestamp(),
+        };
+        storage::set_batch_recall_info(env, &brand, &batch_id, &info, batch.warranty_months);
         storage::set_batch(env, &brand, &batch_id, &batch);
 
         BatchRecalled {
             brand,
             batch_id,
-            reason_hash,
+            severity,
+            reason_hash: notice_hash.clone(),
+            notice_hash,
         }
         .publish(env);
         Ok(())
@@ -916,6 +1021,14 @@ impl VeritagRegistry {
         batch_id: BytesN<32>,
     ) -> Option<BytesN<32>> {
         storage::get_batch(&env, &brand, &batch_id).and_then(|batch| batch.metadata_cid)
+    }
+
+    pub fn get_batch_recall_info(
+        env: Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+    ) -> Option<RecallInfo> {
+        storage::get_batch_recall_info(&env, &brand, &batch_id)
     }
 
     pub fn get_unit(env: Env, unit_id: BytesN<32>) -> Option<UnitView> {
@@ -1066,21 +1179,7 @@ impl VeritagRegistry {
         Ok(record)
     }
 
-    fn require_service_center_tier(
-        env: &Env,
-        brand: &Address,
-        service_center: &Address,
-        required_tier: u32,
-    ) -> Result<(), RegistryError> {
-        let record = storage::get_service_center(env, brand, service_center)
-            .ok_or(RegistryError::ServiceCenterNotAuthorized)?;
-        if !record.active || !(required_tier..=3).contains(&record.tier) {
-            return Err(RegistryError::ServiceCenterNotAuthorized);
-        }
-        Ok(())
-    }
-
-    fn ensure_unit_operational(env: &Env, unit: &Unit) -> Result<(), RegistryError> {
+    fn ensure_unit_operational(env: &Env, unit: &Unit) -> Result<Batch, RegistryError> {
         Self::ensure_unit_not_retired(unit)?;
         let batch = storage::get_batch(env, &unit.brand, &unit.batch_id)
             .ok_or(RegistryError::BatchNotFound)?;
@@ -1090,12 +1189,25 @@ impl VeritagRegistry {
         if unit.status == UnitStatus::Flagged {
             return Err(RegistryError::UnitFlagged);
         }
-        Ok(())
+        Ok(batch)
     }
 
     fn ensure_unit_not_retired(unit: &Unit) -> Result<(), RegistryError> {
         if unit.status == UnitStatus::Retired {
             return Err(RegistryError::UnitRetired);
+        }
+        Ok(())
+    }
+
+    fn ensure_transfer_limit(env: &Env, unit: &Unit) -> Result<(), RegistryError> {
+        let batch = storage::get_batch(env, &unit.brand, &unit.batch_id)
+            .ok_or(RegistryError::BatchNotFound)?;
+        if unit.transfer_count == u32::MAX
+            || batch
+                .max_transfers
+                .is_some_and(|max| unit.transfer_count >= max)
+        {
+            return Err(RegistryError::TransferLimitReached);
         }
         Ok(())
     }
@@ -1121,6 +1233,7 @@ impl VeritagRegistry {
             batch_id: unit.batch_id,
             owner: unit.owner,
             status: effective_status,
+            transfer_count: unit.transfer_count,
             activated_at: unit.activated_at,
             warranty_expiry: unit.warranty_expiry,
             warranty_valid,
@@ -1191,6 +1304,13 @@ impl VeritagRegistry {
         action: &BrandAction,
     ) -> Result<(), RegistryError> {
         match action {
+            BrandAction::FreezeBatch(batch_id) | BrandAction::UnfreezeBatch(batch_id) => {
+                let batch =
+                    storage::get_batch(env, brand, batch_id).ok_or(RegistryError::BatchNotFound)?;
+                if batch.recalled {
+                    return Err(RegistryError::BatchRecalled);
+                }
+            }
             BrandAction::RecallBatch(batch_id, _) => {
                 storage::get_batch(env, brand, batch_id).ok_or(RegistryError::BatchNotFound)?;
             }
@@ -1225,6 +1345,12 @@ impl VeritagRegistry {
             return Err(RegistryError::NotAuthorized);
         }
         match &proposal.action {
+            BrandAction::FreezeBatch(batch_id) => {
+                Self::set_batch_frozen_internal(env, brand.clone(), batch_id.clone(), true)?
+            }
+            BrandAction::UnfreezeBatch(batch_id) => {
+                Self::set_batch_frozen_internal(env, brand.clone(), batch_id.clone(), false)?
+            }
             BrandAction::RecallBatch(batch_id, reason_hash) => Self::recall_batch_internal(
                 env,
                 brand.clone(),
