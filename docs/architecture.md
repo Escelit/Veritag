@@ -25,6 +25,7 @@ flowchart TD
    - Uses **Instance** storage for `Config`, **Persistent** storage for `Brand`, `ServiceCenter`, `Batch`, `Unit`, and `Claim` (with TTLs automatically extended to cover the remaining warranty + 90-day buffer), and **Temporary** storage for expiring `TransferOffer` codes.
 2. **`contracts/passkey-account` (`PasskeyAccountContract`):**
    - Implements Soroban `CustomAccountInterface` (`__check_auth`) verifying WebAuthn `authenticatorData` (User Present bit), base64url challenge binding in `clientDataJSON`, and `secp256r1_verify` (P-256) hardware signatures, plus optional `Recovery` signer fallback and passkey rotation (`add_passkey`, `remove_passkey`).
+   - Each account starts with a sequential execution nonce of zero, exposed by `get_nonce`. Clients use the unpadded base64url encoding of `SHA256(signature_payload || nonce_be_u64)` as the WebAuthn challenge, where the nonce occupies 8 bytes in big endian order. Successful passkey and recovery authorizations advance the shared nonce; failed authorization leaves it unchanged. Replays and out of order assertions return `ChallengeMismatch`, duplicate challenge fields are rejected, and nonce exhaustion fails without wrapping.
 3. **`contracts/account-factory` (`AccountFactoryContract`):**
    - Deterministically deploys `PasskeyAccountContract` instances via `env.deployer().with_current_contract(salt).deploy_v2(...)` so consumers get a predictable `C...` Soroban smart wallet address from their WebAuthn credential ID before or during first product activation.
 

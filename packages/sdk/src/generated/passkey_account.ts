@@ -33,7 +33,7 @@ if (typeof window !== "undefined") {
 
 
 
-export type DataKey = {tag: "Passkey", values: readonly [Buffer]} | {tag: "PasskeyCount", values: void} | {tag: "RecoverySigner", values: void};
+export type DataKey = {tag: "Passkey", values: readonly [Buffer]} | {tag: "PasskeyCount", values: void} | {tag: "RecoverySigner", values: void} | {tag: "Nonce", values: void};
 
 export const AccountError = {
   1: {message:"UnknownCredential"},
@@ -42,7 +42,8 @@ export const AccountError = {
   4: {message:"ChallengeMismatch"},
   5: {message:"RecoveryNotConfigured"},
   6: {message:"CannotRemoveLastAuthMethod"},
-  7: {message:"InvalidPublicKey"}
+  7: {message:"InvalidPublicKey"},
+  8: {message:"NonceExhausted"}
 }
 
 export type AccountSignature = {tag: "WebAuthn", values: readonly [WebAuthnCredential]} | {tag: "Recovery", values: void};
@@ -56,6 +57,13 @@ export interface WebAuthnCredential {
 }
 
 export interface Client {
+  /**
+   * Construct and simulate a get_nonce transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns the next account authorization nonce.
+   * WebAuthn clients use SHA256(signature_payload || nonce.to_be_bytes()) as the challenge.
+   */
+  get_nonce: (options?: MethodOptions) => Promise<AssembledTransaction<u64>>
+
   /**
    * Construct and simulate a add_passkey transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    */
@@ -106,10 +114,11 @@ export class Client extends ContractClient {
   }
   constructor(public readonly options: ContractClientOptions) {
     super(
-      new ContractSpec([ "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAAAwAAAAEAAAAAAAAAB1Bhc3NrZXkAAAAAAQAAAA4AAAAAAAAAAAAAAAxQYXNza2V5Q291bnQAAAAAAAAAAAAAAA5SZWNvdmVyeVNpZ25lcgAA",
-        "AAAABAAAAAAAAAAAAAAADEFjY291bnRFcnJvcgAAAAcAAAAAAAAAEVVua25vd25DcmVkZW50aWFsAAAAAAAAAQAAAAAAAAAYSW52YWxpZEF1dGhlbnRpY2F0b3JEYXRhAAAAAgAAAAAAAAAOVXNlck5vdFByZXNlbnQAAAAAAAMAAAAAAAAAEUNoYWxsZW5nZU1pc21hdGNoAAAAAAAABAAAAAAAAAAVUmVjb3ZlcnlOb3RDb25maWd1cmVkAAAAAAAABQAAAAAAAAAaQ2Fubm90UmVtb3ZlTGFzdEF1dGhNZXRob2QAAAAAAAYAAAAAAAAAEEludmFsaWRQdWJsaWNLZXkAAAAH",
+      new ContractSpec([ "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAABAAAAAEAAAAAAAAAB1Bhc3NrZXkAAAAAAQAAAA4AAAAAAAAAAAAAAAxQYXNza2V5Q291bnQAAAAAAAAAAAAAAA5SZWNvdmVyeVNpZ25lcgAAAAAAAAAAAAAAAAAFTm9uY2UAAAA=",
+        "AAAABAAAAAAAAAAAAAAADEFjY291bnRFcnJvcgAAAAgAAAAAAAAAEVVua25vd25DcmVkZW50aWFsAAAAAAAAAQAAAAAAAAAYSW52YWxpZEF1dGhlbnRpY2F0b3JEYXRhAAAAAgAAAAAAAAAOVXNlck5vdFByZXNlbnQAAAAAAAMAAAAAAAAAEUNoYWxsZW5nZU1pc21hdGNoAAAAAAAABAAAAAAAAAAVUmVjb3ZlcnlOb3RDb25maWd1cmVkAAAAAAAABQAAAAAAAAAaQ2Fubm90UmVtb3ZlTGFzdEF1dGhNZXRob2QAAAAAAAYAAAAAAAAAEEludmFsaWRQdWJsaWNLZXkAAAAHAAAAAAAAAA5Ob25jZUV4aGF1c3RlZAAAAAAACA==",
         "AAAAAgAAAAAAAAAAAAAAEEFjY291bnRTaWduYXR1cmUAAAACAAAAAQAAAAAAAAAIV2ViQXV0aG4AAAABAAAH0AAAABJXZWJBdXRobkNyZWRlbnRpYWwAAAAAAAAAAAAAAAAACFJlY292ZXJ5",
         "AAAAAQAAAAAAAAAAAAAAEldlYkF1dGhuQ3JlZGVudGlhbAAAAAAABAAAAAAAAAASYXV0aGVudGljYXRvcl9kYXRhAAAAAAAOAAAAAAAAABBjbGllbnRfZGF0YV9qc29uAAAADgAAAAAAAAANY3JlZGVudGlhbF9pZAAAAAAAAA4AAAAAAAAACXNpZ25hdHVyZQAAAAAAA+4AAABA",
+        "AAAAAAAAAIVSZXR1cm5zIHRoZSBuZXh0IGFjY291bnQgYXV0aG9yaXphdGlvbiBub25jZS4KV2ViQXV0aG4gY2xpZW50cyB1c2UgU0hBMjU2KHNpZ25hdHVyZV9wYXlsb2FkIHx8IG5vbmNlLnRvX2JlX2J5dGVzKCkpIGFzIHRoZSBjaGFsbGVuZ2UuAAAAAAAACWdldF9ub25jZQAAAAAAAAAAAAABAAAABg==",
         "AAAAAAAAAAAAAAALYWRkX3Bhc3NrZXkAAAAAAgAAAAAAAAANY3JlZGVudGlhbF9pZAAAAAAAAA4AAAAAAAAACnB1YmxpY19rZXkAAAAAA+4AAABBAAAAAQAAA+kAAAACAAAH0AAAAAxBY2NvdW50RXJyb3I=",
         "AAAAAAAAAAAAAAALZ2V0X3Bhc3NrZXkAAAAAAQAAAAAAAAANY3JlZGVudGlhbF9pZAAAAAAAAA4AAAABAAAD6AAAA+4AAABB",
         "AAAAAAAAAAAAAAAMX19jaGVja19hdXRoAAAAAwAAAAAAAAARc2lnbmF0dXJlX3BheWxvYWQAAAAAAAPuAAAAIAAAAAAAAAAJc2lnbmF0dXJlAAAAAAAH0AAAABBBY2NvdW50U2lnbmF0dXJlAAAAAAAAAA1hdXRoX2NvbnRleHRzAAAAAAAD6gAAB9AAAAAHQ29udGV4dAAAAAABAAAD6QAAAAIAAAfQAAAADEFjY291bnRFcnJvcg==",
@@ -122,7 +131,8 @@ export class Client extends ContractClient {
     )
   }
   public readonly fromJSON = {
-    add_passkey: this.txFromJSON<Result<void>>,
+    get_nonce: this.txFromJSON<u64>,
+        add_passkey: this.txFromJSON<Result<void>>,
         get_passkey: this.txFromJSON<Option<Buffer>>,
         remove_passkey: this.txFromJSON<Result<void>>,
         get_passkey_count: this.txFromJSON<u32>,
