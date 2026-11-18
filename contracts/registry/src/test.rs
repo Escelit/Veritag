@@ -9,7 +9,6 @@ use soroban_sdk::{
 };
 
 use crate::{
-    events::{BatchFrozen, BatchUnfrozen},
     merkle::{compute_leaf, hash_pair, sha256_bytes, MAX_PROOF_DEPTH},
     storage::DataKey,
     types::{
@@ -850,252 +849,20 @@ fn test_batch_expiration_legacy_storage() {
     assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
 }
 
-#[test]
-fn test_freeze_and_unfreeze_batch() {
-    let f = TestFixture::setup();
+fn activate_warranty_unit(f: &TestFixture<'_>, warranty_months: u32) -> BytesN<32> {
     f.setup_verified_brand();
-    let batch_id = f.hash_str("BATCH-FREEZE");
-    let (root, units) = f.build_sample_batch(2);
-    f.client.commit_batch(
-        &f.brand,
-        &batch_id,
-        &root,
-        &12,
-        &f.hash_str("META"),
-        &2,
-        &None,
-        &None,
-    );
-    assert!(!f.client.get_batch(&f.brand, &batch_id).unwrap().frozen);
-
-    let active_unit = f.client.activate(
-        &f.brand,
-        &batch_id,
-        &units[0].0,
-        &units[0].3,
-        &units[0].1,
-        &f.alice,
-    );
-    let before = f.client.get_unit(&active_unit).unwrap();
-    f.client.freeze_batch(&f.brand, &batch_id);
-    assert_eq!(
-        f.env.events().all(),
-        [BatchFrozen {
-            brand: f.brand.clone(),
-            batch_id: batch_id.clone(),
-        }
-        .to_xdr(&f.env, &f.contract_id)]
-    );
-    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().frozen);
-
-    assert_eq!(
-        f.client.try_activate(
-            &f.brand,
-            &batch_id,
-            &units[1].0,
-            &units[1].3,
-            &units[1].1,
-            &f.bob,
-        ),
-        Err(Ok(RegistryError::BatchFrozen))
-    );
-    assert_eq!(
-        f.client.try_file_claim(&active_unit, &f.service_center),
-        Err(Ok(RegistryError::BatchFrozen))
-    );
-    assert_eq!(f.client.get_unit(&active_unit).unwrap(), before);
-    let inactive_unit = f.client.compute_unit_id(&f.brand, &batch_id, &units[1].0);
-    assert!(f.client.get_unit(&inactive_unit).is_none());
-
-    // Repeated freezes are harmless and do not emit another transition event.
-    f.client.freeze_batch(&f.brand, &batch_id);
-    assert!(f.env.events().all().events().is_empty());
-    f.client.unfreeze_batch(&f.brand, &batch_id);
-    assert_eq!(
-        f.env.events().all(),
-        [BatchUnfrozen {
-            brand: f.brand.clone(),
-            batch_id: batch_id.clone(),
-        }
-        .to_xdr(&f.env, &f.contract_id)]
-    );
-    assert!(!f.client.get_batch(&f.brand, &batch_id).unwrap().frozen);
-    assert_eq!(
-        f.client.activate(
-            &f.brand,
-            &batch_id,
-            &units[1].0,
-            &units[1].3,
-            &units[1].1,
-            &f.bob,
-        ),
-        inactive_unit
-    );
-    assert_eq!(f.client.file_claim(&active_unit, &f.service_center), 1);
-    assert_eq!(
-        f.client.get_unit(&active_unit).unwrap().warranty_expiry,
-        before.warranty_expiry
-    );
-    f.client.unfreeze_batch(&f.brand, &batch_id);
-    assert!(f.env.events().all().events().is_empty());
-    assert_eq!(RegistryError::BatchFrozen as u32, 25);
-}
-
-#[test]
-fn test_freeze_requires_current_brand_admin() {
-    let f = TestFixture::setup();
-    f.setup_verified_brand();
-    let batch_id = f.hash_str("BATCH-FREEZE-AUTH");
-    let root = f.hash_str("ROOT");
-    f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &root, &1, &None, &None);
-    f.client.rotate_brand_admin(&f.brand, &f.bob);
-
-    for method in ["freeze_batch", "unfreeze_batch"] {
-        for signer in [&f.alice, &f.brand] {
-            f.env.mock_auths(&[MockAuth {
-                address: signer,
-                invoke: &MockAuthInvoke {
-                    contract: &f.contract_id,
-                    fn_name: method,
-                    args: (f.brand.clone(), batch_id.clone()).into_val(&f.env),
-                    sub_invokes: &[],
-                },
-            }]);
-            let result = if method == "freeze_batch" {
-                f.client.try_freeze_batch(&f.brand, &batch_id)
-            } else {
-                f.client.try_unfreeze_batch(&f.brand, &batch_id)
-            };
-            assert!(result.is_err());
-            assert_eq!(
-                f.client.get_batch(&f.brand, &batch_id).unwrap().frozen,
-                method == "unfreeze_batch"
-            );
-        }
-        f.env.mock_auths(&[MockAuth {
-            address: &f.bob,
-            invoke: &MockAuthInvoke {
-                contract: &f.contract_id,
-                fn_name: method,
-                args: (f.brand.clone(), batch_id.clone()).into_val(&f.env),
-                sub_invokes: &[],
-            },
-        }]);
-        if method == "freeze_batch" {
-            f.client.freeze_batch(&f.brand, &batch_id);
-        } else {
-            f.client.unfreeze_batch(&f.brand, &batch_id);
-        }
-    }
-}
-
-#[test]
-fn test_freeze_missing_batch_and_permanent_recall() {
-    let f = TestFixture::setup();
-    f.setup_verified_brand();
-    let batch_id = f.hash_str("BATCH-FREEZE-RECALL");
-    assert_eq!(
-        f.client.try_freeze_batch(&f.brand, &batch_id),
-        Err(Ok(RegistryError::BatchNotFound))
-    );
-    assert_eq!(
-        f.client.try_unfreeze_batch(&f.brand, &batch_id),
-        Err(Ok(RegistryError::BatchNotFound))
-    );
-    assert_eq!(
-        f.client.try_freeze_batch(&f.bob, &batch_id),
-        Err(Ok(RegistryError::BrandNotFound))
-    );
-    assert_eq!(
-        f.client.try_unfreeze_batch(&f.bob, &batch_id),
-        Err(Ok(RegistryError::BrandNotFound))
-    );
+    let batch_id = f.hash_str("BATCH-EXTENSION");
     let (root, units) = f.build_sample_batch(1);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &root, &1, &None, &None);
-    let unit_id = f.client.activate(
-        &f.brand,
-        &batch_id,
-        &units[0].0,
-        &units[0].3,
-        &units[0].1,
-        &f.alice,
-    );
-    f.client.freeze_batch(&f.brand, &batch_id);
-    f.client
-        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
-    assert_eq!(
-        f.client.try_unfreeze_batch(&f.brand, &batch_id),
-        Err(Ok(RegistryError::BatchRecalled))
-    );
-    assert_eq!(
-        f.client.try_freeze_batch(&f.brand, &batch_id),
-        Err(Ok(RegistryError::BatchRecalled))
-    );
-    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
-    assert_eq!(
-        f.client.try_activate(
-            &f.brand,
-            &batch_id,
-            &units[0].0,
-            &units[0].3,
-            &units[0].1,
-            &f.bob,
-        ),
-        Err(Ok(RegistryError::BatchRecalled))
-    );
-    assert_eq!(
-        f.client.try_file_claim(&unit_id, &f.service_center),
-        Err(Ok(RegistryError::BatchRecalled))
-    );
-}
-
-#[test]
-fn test_freeze_legacy_batch_preserves_expiration() {
-    use soroban_sdk::{Map, Symbol, TryFromVal, Val};
-    let f = TestFixture::setup();
-    f.setup_verified_brand();
-    let batch_id = f.hash_str("LEGACY-FREEZE-EXPIRATION");
-    let (root, units) = f.build_sample_batch(2);
-    let expiry = f.env.ledger().timestamp() + 100;
     f.client.commit_batch(
         &f.brand,
         &batch_id,
         &root,
-        &12,
-        &root,
-        &2,
-        &Some(expiry),
+        &warranty_months,
+        &f.hash_str("META"),
+        &1,
+        &None,
         &None,
     );
-    let batch = f.client.get_batch(&f.brand, &batch_id).unwrap();
-    let value: Val = batch.into_val(&f.env);
-    let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &value).unwrap();
-    fields.remove(Symbol::new(&f.env, "frozen"));
-    f.env.as_contract(&f.contract_id, || {
-        f.env
-            .storage()
-            .persistent()
-            .set(&DataKey::Batch(f.brand.clone(), batch_id.clone()), &fields);
-    });
-    let legacy = f.client.get_batch(&f.brand, &batch_id).unwrap();
-    assert!(!legacy.frozen);
-    assert_eq!(legacy.expires_at, Some(expiry));
-    f.client.freeze_batch(&f.brand, &batch_id);
-    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().frozen);
-    assert_eq!(
-        f.client.try_activate(
-            &f.brand,
-            &batch_id,
-            &units[0].0,
-            &units[0].3,
-            &units[0].1,
-            &f.alice,
-        ),
-        Err(Ok(RegistryError::BatchFrozen))
-    );
-    f.client.unfreeze_batch(&f.brand, &batch_id);
     f.client.activate(
         &f.brand,
         &batch_id,
@@ -1103,116 +870,319 @@ fn test_freeze_legacy_batch_preserves_expiration() {
         &units[0].3,
         &units[0].1,
         &f.alice,
+    )
+}
+
+#[test]
+fn test_extend_warranty_active_and_audit_event() {
+    use crate::events::WarrantyExtended;
+    use soroban_sdk::events::Event;
+
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 12);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp += SECONDS_PER_MONTH);
+
+    let expected_end = before.warranty_expiry + 6 * SECONDS_PER_MONTH;
+    assert_eq!(
+        f.client.extend_warranty(&f.brand, &unit_id, &6),
+        expected_end
+    );
+    assert_eq!(
+        f.env.events().all(),
+        [WarrantyExtended {
+            unit_id: unit_id.clone(),
+            added_months: 6,
+            new_warranty_end: expected_end,
+        }
+        .to_xdr(&f.env, &f.contract_id)]
     );
 
-    f.env.ledger().with_mut(|li| li.timestamp = expiry + 1);
-    f.client.freeze_batch(&f.brand, &batch_id);
-    f.client.unfreeze_batch(&f.brand, &batch_id);
-    let expired = f.client.get_batch(&f.brand, &batch_id).unwrap();
-    assert_eq!(expired.expires_at, Some(expiry));
-    assert_eq!(expired.status, crate::types::BatchStatus::Expired);
+    let after = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(after.warranty_expiry, expected_end);
+    assert_eq!(after.activated_at, before.activated_at);
+    assert_eq!(after.owner, before.owner);
+    assert_eq!(after.claims_used, before.claims_used);
+    assert_eq!(after.history_len, before.history_len + 1);
+    assert!(after.warranty_valid);
+    assert!(f.client.is_warranty_valid(&unit_id));
+}
+
+#[test]
+fn test_extend_warranty_expired_uses_previous_expiry() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 12);
+    let old_end = f.client.get_unit(&unit_id).unwrap().warranty_expiry;
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = old_end + 2 * SECONDS_PER_MONTH + 1);
+    assert!(!f.client.is_warranty_valid(&unit_id));
+
+    // A small extension can leave a lapsed warranty expired; it never resets to now.
     assert_eq!(
-        f.client.try_activate(
-            &f.brand,
-            &batch_id,
-            &units[1].0,
-            &units[1].3,
-            &units[1].1,
-            &f.alice,
-        ),
-        Err(Ok(RegistryError::BatchExpired))
+        f.client.extend_warranty(&f.brand, &unit_id, &1),
+        old_end + SECONDS_PER_MONTH
+    );
+    assert!(!f.client.is_warranty_valid(&unit_id));
+    assert_eq!(
+        f.client.extend_warranty(&f.brand, &unit_id, &2),
+        old_end + 3 * SECONDS_PER_MONTH
+    );
+    assert!(f.client.is_warranty_valid(&unit_id));
+    assert_eq!(f.client.file_claim(&unit_id, &f.service_center), 1);
+}
+
+#[test]
+fn test_extend_warranty_cap_and_invalid_months() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 12);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(
+        f.client.try_extend_warranty(&f.brand, &unit_id, &0),
+        Err(Ok(RegistryError::InvalidInput))
+    );
+    assert_eq!(
+        f.client.try_extend_warranty(&f.brand, &unit_id, &u32::MAX),
+        Err(Ok(RegistryError::WarrantyLimitReached))
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+
+    f.client.extend_warranty(&f.brand, &unit_id, &100);
+    let ceiling = before.activated_at + 120 * SECONDS_PER_MONTH;
+    assert_eq!(f.client.extend_warranty(&f.brand, &unit_id, &8), ceiling);
+    let at_cap = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(
+        f.client.try_extend_warranty(&f.brand, &unit_id, &1),
+        Err(Ok(RegistryError::WarrantyLimitReached))
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), at_cap);
+}
+
+#[test]
+fn test_extend_warranty_requires_originating_brand_admin() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 12);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    let other_brand = Address::generate(&f.env);
+    f.client
+        .register_brand(&other_brand, &String::from_str(&f.env, "other.example"));
+    assert_eq!(
+        f.client.try_extend_warranty(&other_brand, &unit_id, &1),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+
+    let rotated_admin = Address::generate(&f.env);
+    f.client.rotate_brand_admin(&f.brand, &rotated_admin);
+    let args: Vec<soroban_sdk::Val> = (f.brand.clone(), unit_id.clone(), 1u32).into_val(&f.env);
+    // Owners, service centers, registry admins and the former brand key cannot authorize.
+    for unauthorized in [&f.alice, &f.service_center, &f.admin, &f.brand] {
+        f.env.mock_auths(&[MockAuth {
+            address: unauthorized,
+            invoke: &MockAuthInvoke {
+                contract: &f.contract_id,
+                fn_name: "extend_warranty",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(f
+            .client
+            .try_extend_warranty(&f.brand, &unit_id, &1)
+            .is_err());
+        assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+    }
+    f.env.mock_auths(&[MockAuth {
+        address: &rotated_admin,
+        invoke: &MockAuthInvoke {
+            contract: &f.contract_id,
+            fn_name: "extend_warranty",
+            args,
+            sub_invokes: &[],
+        },
+    }]);
+    assert_eq!(
+        f.client.extend_warranty(&f.brand, &unit_id, &1),
+        before.warranty_expiry + SECONDS_PER_MONTH
     );
 }
 
 #[test]
-fn test_freeze_requires_multisig_approval() {
-    use crate::types::{BrandAction, BrandAdminConfig};
+fn test_extend_warranty_missing_and_nonoperational_units() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 12);
+    assert_eq!(
+        f.client
+            .try_extend_warranty(&f.brand, &f.hash_str("MISSING"), &1),
+        Err(Ok(RegistryError::UnitNotFound))
+    );
+    for (status, error) in [
+        (UnitStatus::Recalled, RegistryError::BatchRecalled),
+        (UnitStatus::Retired, RegistryError::UnitRetired),
+        (UnitStatus::Flagged, RegistryError::UnitFlagged),
+    ] {
+        f.env.as_contract(&f.contract_id, || {
+            let mut unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
+            unit.status = status;
+            crate::storage::set_unit(&f.env, &unit_id, &unit);
+        });
+        let before = f.client.get_unit(&unit_id).unwrap();
+        assert_eq!(
+            f.client.try_extend_warranty(&f.brand, &unit_id, &1),
+            Err(Ok(error))
+        );
+        assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+    }
+    // A recalled batch also blocks extensions of a unit whose stored status is Active.
+    f.env.as_contract(&f.contract_id, || {
+        let mut unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
+        unit.status = UnitStatus::Active;
+        crate::storage::set_unit(&f.env, &unit_id, &unit);
+    });
+    let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
+    f.client
+        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
+    assert_eq!(
+        f.client.try_extend_warranty(&f.brand, &unit_id, &1),
+        Err(Ok(RegistryError::BatchRecalled))
+    );
+}
+
+#[test]
+fn test_extend_warranty_refreshes_unit_ttl() {
+    let f = TestFixture::setup();
+    let unit_id = activate_warranty_unit(&f, 1);
+    f.env
+        .ledger()
+        .with_mut(|li| li.sequence_number += 1_200_000);
+    f.client.bump_unit_ttl(&unit_id);
+    f.env.ledger().with_mut(|li| li.sequence_number += 800_000);
+    let old_ttl = f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Unit(unit_id.clone()))
+    });
+    f.client.extend_warranty(&f.brand, &unit_id, &6);
+    let new_ttl = f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Unit(unit_id.clone()))
+    });
+    assert!(new_ttl > old_ttl);
+}
+#[test]
+fn test_merged_batch_metadata_and_expiration_storage() {
+    use crate::types::BatchStatus;
+    use soroban_sdk::{Map, Symbol, TryFromVal, Val};
+
     let f = TestFixture::setup();
     f.setup_verified_brand();
-    let batch_id = f.hash_str("MULTISIG-FREEZE");
+    let batch_id = f.hash_str("MERGED-BATCH");
     let (root, _) = f.build_sample_batch(1);
-    let metadata = f.hash_str("METADATA");
+    let metadata = f.hash_str("DOCUMENT");
+    let expiry = f.env.ledger().timestamp() + 100;
     f.client.commit_batch(
         &f.brand,
         &batch_id,
         &root,
         &12,
-        &root,
+        &f.hash_str("META"),
         &1,
-        &None,
+        &Some(expiry),
         &Some(metadata.clone()),
     );
-    f.client.configure_brand_admins(
-        &f.brand,
-        &BrandAdminConfig {
-            admins: Vec::from_array(&f.env, [f.brand.clone(), f.bob.clone()]),
-            threshold: 2,
-        },
-    );
-    assert_eq!(
-        f.client.try_freeze_batch(&f.brand, &batch_id),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    let proposal = f.client.propose_brand_action(
-        &f.brand,
-        &f.brand,
-        &BrandAction::FreezeBatch(batch_id.clone()),
-    );
-    assert!(!f.client.get_batch(&f.brand, &batch_id).unwrap().frozen);
-    assert_eq!(
-        f.client
-            .try_approve_brand_action(&f.alice, &f.brand, &proposal),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &proposal));
-    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().frozen);
-    assert_eq!(
-        f.client.try_unfreeze_batch(&f.brand, &batch_id),
-        Err(Ok(RegistryError::NotAuthorized))
-    );
-    let proposal = f.client.propose_brand_action(
-        &f.bob,
-        &f.brand,
-        &BrandAction::UnfreezeBatch(batch_id.clone()),
-    );
-    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().frozen);
-    assert!(f.client.approve_brand_action(&f.brand, &f.brand, &proposal));
     let batch = f.client.get_batch(&f.brand, &batch_id).unwrap();
-    assert!(!batch.frozen);
-    assert_eq!(batch.metadata_cid, Some(metadata));
+    assert_eq!(batch.expires_at, Some(expiry));
+    assert_eq!(
+        f.client.get_batch_metadata_cid(&f.brand, &batch_id),
+        Some(metadata.clone())
+    );
+
+    // Preserve whichever optional feature was stored by an earlier contract version.
+    for (omit_expiry, omit_metadata) in [(true, false), (false, true), (true, true)] {
+        f.env.as_contract(&f.contract_id, || {
+            let value: Val = batch.clone().into_val(&f.env);
+            let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &value).unwrap();
+            if omit_expiry {
+                fields.remove(Symbol::new(&f.env, "expires_at"));
+                fields.remove(Symbol::new(&f.env, "status"));
+            }
+            if omit_metadata {
+                fields.remove(Symbol::new(&f.env, "metadata_cid"));
+            }
+            f.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Batch(f.brand.clone(), batch_id.clone()), &fields);
+        });
+        let restored = f.client.get_batch(&f.brand, &batch_id).unwrap();
+        assert_eq!(
+            restored.expires_at,
+            if omit_expiry { None } else { Some(expiry) }
+        );
+        assert_eq!(
+            restored.metadata_cid,
+            if omit_metadata {
+                None
+            } else {
+                Some(metadata.clone())
+            }
+        );
+    }
+    f.env.as_contract(&f.contract_id, || {
+        crate::storage::set_batch(&f.env, &f.brand, &batch_id, &batch);
+    });
+    f.env.ledger().with_mut(|li| li.timestamp = expiry + 1);
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Expired
+    );
+    assert_eq!(
+        f.client.get_batch_metadata_cid(&f.brand, &batch_id),
+        Some(metadata)
+    );
 }
 
 #[test]
-fn test_freeze_preserves_unit_retirement_guard() {
+fn test_merged_legacy_brand_governance() {
+    use crate::{
+        storage::LegacyBrand,
+        types::{BrandAction, BrandAdminConfig},
+    };
+
     let f = TestFixture::setup();
-    f.setup_verified_brand();
-    let batch_id = f.hash_str("RETIRED-FREEZE");
-    let (root, units) = f.build_sample_batch(1);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &root, &1, &None, &None);
-    let unit_id = f.client.activate(
+    let legacy = LegacyBrand {
+        admin: f.brand.clone(),
+        domain: String::from_str(&f.env, "legacy.example"),
+        verified: true,
+        registered_at: f.env.ledger().timestamp(),
+    };
+    f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Brand(f.brand.clone()), &legacy);
+    });
+    let config = BrandAdminConfig {
+        admins: Vec::from_array(&f.env, [f.brand.clone(), f.alice.clone()]),
+        threshold: 2,
+    };
+    f.client.configure_brand_admins(&f.brand, &config);
+    assert_eq!(f.client.get_brand_admin_config(&f.brand), Some(config));
+    assert_eq!(
+        f.client
+            .try_register_service_center(&f.brand, &f.service_center),
+        Err(Ok(RegistryError::NotAuthorized)),
+    );
+    let proposal = f.client.propose_brand_action(
         &f.brand,
-        &batch_id,
-        &units[0].0,
-        &units[0].3,
-        &units[0].1,
-        &f.alice,
+        &f.brand,
+        &BrandAction::RegisterServiceCenter(f.service_center.clone()),
     );
-    f.client.retire_unit(&f.alice, &unit_id, &1, &root);
-    f.client.freeze_batch(&f.brand, &batch_id);
-    assert_eq!(
-        f.client.try_activate(
-            &f.brand,
-            &batch_id,
-            &units[0].0,
-            &units[0].3,
-            &units[0].1,
-            &f.alice
-        ),
-        Err(Ok(RegistryError::UnitRetired))
-    );
-    assert_eq!(
-        f.client.try_file_claim(&unit_id, &f.service_center),
-        Err(Ok(RegistryError::UnitRetired))
-    );
+    assert!(!f.client.is_service_center(&f.brand, &f.service_center));
+    assert!(f.client.approve_brand_action(&f.alice, &f.brand, &proposal));
+    assert!(f.client.is_service_center(&f.brand, &f.service_center));
 }

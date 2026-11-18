@@ -1,4 +1,6 @@
-use soroban_sdk::{contracttype, Address, BytesN, Env, Map, String, Symbol, TryFromVal, Val, Vec};
+use soroban_sdk::{
+    contracttype, Address, BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
+};
 
 use crate::types::{
     Batch, BatchStatus, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, TransferOffer,
@@ -18,6 +20,7 @@ pub struct LegacyBatch {
     pub recalled: bool,
 }
 
+/// Storage layout used before threshold governance was introduced.
 #[contracttype]
 #[derive(Clone)]
 pub struct LegacyBrand {
@@ -215,32 +218,22 @@ pub fn get_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> Option<Ba
         .storage()
         .persistent()
         .get(&DataKey::Batch(brand.clone(), batch_id.clone()))?;
+    // Independently merged batch features may be absent from older stored records.
     let mut fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid batch storage");
-    let mut batch = if fields.len() == 7 {
-        let legacy = LegacyBatch::try_from_val(env, &value).expect("invalid batch storage");
-        Batch {
-            brand: legacy.brand,
-            merkle_root: legacy.merkle_root,
-            warranty_months: legacy.warranty_months,
-            product_meta_hash: legacy.product_meta_hash,
-            metadata_cid: None,
-            unit_count: legacy.unit_count,
-            created_at: legacy.created_at,
-            recalled: legacy.recalled,
-            frozen: false,
-            expires_at: None,
-            status: BatchStatus::Active,
-        }
-    } else {
-        if !fields.contains_key(Symbol::new(env, "metadata_cid")) {
-            fields.set(Symbol::new(env, "metadata_cid"), Val::VOID.to_val());
-        }
-        // Batches stored before freezing default to an unfrozen state.
-        if !fields.contains_key(Symbol::new(env, "frozen")) {
-            fields.set(Symbol::new(env, "frozen"), Val::FALSE.to_val());
-        }
-        Batch::try_from_val(env, &fields.to_val()).expect("invalid batch storage")
-    };
+    let metadata_key = Symbol::new(env, "metadata_cid");
+    if !fields.contains_key(metadata_key.clone()) {
+        fields.set(metadata_key, None::<BytesN<32>>.into_val(env));
+    }
+    let expiry_key = Symbol::new(env, "expires_at");
+    if !fields.contains_key(expiry_key.clone()) {
+        fields.set(expiry_key, None::<u64>.into_val(env));
+    }
+    let status_key = Symbol::new(env, "status");
+    if !fields.contains_key(status_key.clone()) {
+        fields.set(status_key, BatchStatus::Active.into_val(env));
+    }
+    let normalized: Val = fields.into_val(env);
+    let mut batch = Batch::try_from_val(env, &normalized).expect("invalid batch storage");
     // Time advances without a transaction. Derive the effective status on every read.
     batch.status = if batch.recalled {
         BatchStatus::Recalled
