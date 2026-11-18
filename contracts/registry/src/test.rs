@@ -8,7 +8,7 @@ use soroban_sdk::{
 };
 
 use crate::{
-    merkle::{compute_leaf, hash_pair, sha256_bytes, verify_proof, MAX_PROOF_DEPTH},
+    merkle::{compute_leaf, hash_pair, sha256_bytes, MAX_PROOF_DEPTH},
     storage::DataKey,
     types::{
         ClaimOutcome, RegistryError, UnitStatus, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
@@ -197,7 +197,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     let meta = f.hash_str("META");
     assert_eq!(
         f.client
-            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None),
+            .try_commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None, &None),
         Err(Ok(RegistryError::BrandNotVerified))
     );
     assert_eq!(
@@ -216,7 +216,7 @@ fn test_brand_registration_verification_and_key_rotation() {
     assert_eq!(f.client.get_brand(&f.brand).unwrap().admin, rotated_signer);
 
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None);
+        .commit_batch(&f.brand, &batch_id, &root, &24, &meta, &100, &None, &None);
     assert!(f.client.get_batch(&f.brand, &batch_id).is_some());
 }
 
@@ -238,6 +238,7 @@ fn test_merkle_batch_commit_and_lazy_activation() {
             &12,
             &meta_hash,
             &0,
+            &None,
             &None
         ),
         Err(Ok(RegistryError::InvalidInput))
@@ -251,6 +252,7 @@ fn test_merkle_batch_commit_and_lazy_activation() {
         &meta_hash,
         &5,
         &None,
+        &None,
     );
 
     // Duplicate batch rejected
@@ -262,6 +264,7 @@ fn test_merkle_batch_commit_and_lazy_activation() {
             &12,
             &meta_hash,
             &5,
+            &None,
             &None
         ),
         Err(Ok(RegistryError::BatchExists))
@@ -373,6 +376,7 @@ fn test_resale_transfer_offer_redeem_expiry_and_cancel() {
         &meta_hash,
         &2,
         &None,
+        &None,
     );
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
@@ -449,8 +453,16 @@ fn test_warranty_boundary_and_claims_workflow() {
     let batch_id = f.hash_str("BATCH-CLAIMS");
     let meta_hash = f.hash_str("META");
     let (merkle_root, units) = f.build_sample_batch(2);
-    f.client
-        .commit_batch(&f.brand, &batch_id, &merkle_root, &6, &meta_hash, &2, &None);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &merkle_root,
+        &6,
+        &meta_hash,
+        &2,
+        &None,
+        &None,
+    );
 
     let (ref serial0, ref secret0, _, ref proof0) = units[0];
     let unit_id = f
@@ -537,6 +549,7 @@ fn test_flag_unit_and_recall_batch_across_entrypoints() {
         &meta_hash,
         &3,
         &None,
+        &None,
     );
 
     // Activate unit 0 and unit 1; leave unit 2 unactivated
@@ -620,6 +633,7 @@ fn test_ttl_extension_and_strict_authorization() {
         &meta_hash,
         &1,
         &None,
+        &None,
     );
 
     let unit_id = f.client.activate(
@@ -686,8 +700,16 @@ fn test_batch_expiration() {
     let meta = f.hash_str("META");
     let (root, units) = f.build_sample_batch(3);
     let expiry = f.env.ledger().timestamp() + 100;
-    f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &3, &Some(expiry));
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &root,
+        &12,
+        &meta,
+        &3,
+        &Some(expiry),
+        &None,
+    );
     assert_eq!(
         f.client.get_batch(&f.brand, &batch_id).unwrap().status,
         BatchStatus::Active
@@ -755,14 +777,22 @@ fn test_batch_expiration_invalid_commit_and_no_expiry() {
     let now = f.env.ledger().timestamp();
     for expiry in [0, now - 1, now] {
         assert_eq!(
-            f.client
-                .try_commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &Some(expiry)),
+            f.client.try_commit_batch(
+                &f.brand,
+                &batch_id,
+                &root,
+                &12,
+                &meta,
+                &1,
+                &Some(expiry),
+                &None
+            ),
             Err(Ok(RegistryError::InvalidInput))
         );
         assert!(f.client.get_batch(&f.brand, &batch_id).is_none());
     }
     f.client
-        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &None);
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1, &None, &None);
     assert_eq!(
         f.client.get_batch(&f.brand, &batch_id).unwrap().expires_at,
         None
@@ -816,4 +846,432 @@ fn test_batch_expiration_legacy_storage() {
     f.client
         .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
     assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
+}
+
+fn activate_transfer_count_unit(f: &TestFixture<'_>) -> BytesN<32> {
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("BATCH-TRANSFER-COUNT");
+    let (root, units) = f.build_sample_batch(1);
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &root,
+        &12,
+        &f.hash_str("META"),
+        &1,
+        &None,
+        &None,
+    );
+    f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    )
+}
+
+#[test]
+fn test_transfer_count_increments_and_is_visible() {
+    use crate::events::UnitTransferred;
+    use soroban_sdk::events::Event;
+
+    let f = TestFixture::setup();
+    let unit_id = activate_transfer_count_unit(&f);
+    let original = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(original.transfer_count, 0);
+    let batch = f.client.get_batch(&f.brand, &original.batch_id).unwrap();
+    assert_eq!(batch.max_transfers, None);
+    let code = Bytes::from_slice(&f.env, b"COUNT-CODE");
+    let hash = sha256_bytes(&f.env, &code);
+    let expires_at = f.env.ledger().timestamp() + 10_000;
+    let mut previous_owner = f.alice.clone();
+
+    // No cap permits repeated completed transfers; counts are separate from other history.
+    for (index, next_owner) in [&f.bob, &f.alice, &f.bob].into_iter().enumerate() {
+        f.client.create_transfer_offer(&unit_id, &hash, &expires_at);
+        assert_eq!(
+            f.client.get_unit(&unit_id).unwrap().transfer_count,
+            index as u32
+        );
+        f.client.redeem_transfer(&unit_id, &code, next_owner);
+        let count = index as u32 + 1;
+        assert_eq!(
+            f.env.events().all(),
+            [UnitTransferred {
+                unit_id: unit_id.clone(),
+                from: previous_owner,
+                to: next_owner.clone(),
+                transfer_count: count,
+            }
+            .to_xdr(&f.env, &f.contract_id)]
+        );
+        let after = f.client.get_unit(&unit_id).unwrap();
+        assert_eq!(after.transfer_count, count);
+        assert_eq!(after.owner, *next_owner);
+        assert_eq!(after.warranty_expiry, original.warranty_expiry);
+        assert!(f.client.get_transfer_offer(&unit_id).is_none());
+        previous_owner = next_owner.clone();
+    }
+}
+
+#[test]
+fn test_transfer_count_cap_zero_boundary_and_removal() {
+    let f = TestFixture::setup();
+    let unit_id = activate_transfer_count_unit(&f);
+    let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
+    let code = Bytes::from_slice(&f.env, b"LIMIT-CODE");
+    let hash = sha256_bytes(&f.env, &code);
+    let expires_at = f.env.ledger().timestamp() + 10_000;
+
+    f.client.set_max_transfers(&f.brand, &batch_id, &Some(0));
+    assert_eq!(
+        f.client
+            .get_batch(&f.brand, &batch_id)
+            .unwrap()
+            .max_transfers,
+        Some(0)
+    );
+    assert_eq!(
+        f.client
+            .try_create_transfer_offer(&unit_id, &hash, &expires_at),
+        Err(Ok(RegistryError::TransferLimitReached))
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 0);
+    f.client.set_max_transfers(&f.brand, &batch_id, &Some(2));
+    for owner in [&f.bob, &f.alice] {
+        f.client.create_transfer_offer(&unit_id, &hash, &expires_at);
+        f.client.redeem_transfer(&unit_id, &code, owner);
+    }
+    let at_cap = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(at_cap.transfer_count, 2);
+    assert_eq!(
+        f.client
+            .try_create_transfer_offer(&unit_id, &hash, &expires_at),
+        Err(Ok(RegistryError::TransferLimitReached))
+    );
+    assert!(f.client.get_transfer_offer(&unit_id).is_none());
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), at_cap);
+
+    f.client.set_max_transfers(&f.brand, &batch_id, &None);
+    assert_eq!(
+        f.client
+            .get_batch(&f.brand, &batch_id)
+            .unwrap()
+            .max_transfers,
+        None
+    );
+    f.client.create_transfer_offer(&unit_id, &hash, &expires_at);
+    f.client.redeem_transfer(&unit_id, &code, &f.bob);
+    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 3);
+}
+
+#[test]
+fn test_transfer_count_cap_changed_after_offer_blocks_redemption() {
+    let f = TestFixture::setup();
+    let unit_id = activate_transfer_count_unit(&f);
+    let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
+    let code = Bytes::from_slice(&f.env, b"PENDING-CODE");
+    let hash = sha256_bytes(&f.env, &code);
+    f.client
+        .create_transfer_offer(&unit_id, &hash, &(f.env.ledger().timestamp() + 1000));
+    let before = f.client.get_unit(&unit_id).unwrap();
+    let offer = f.client.get_transfer_offer(&unit_id);
+    f.client.set_max_transfers(&f.brand, &batch_id, &Some(0));
+    assert_eq!(
+        f.client.try_redeem_transfer(&unit_id, &code, &f.bob),
+        Err(Ok(RegistryError::TransferLimitReached))
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+    assert_eq!(f.client.get_transfer_offer(&unit_id), offer);
+    f.client.cancel_transfer_offer(&unit_id);
+    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 0);
+}
+
+#[test]
+fn test_transfer_count_failed_redemptions_do_not_increment() {
+    let f = TestFixture::setup();
+    let unit_id = activate_transfer_count_unit(&f);
+    let code = Bytes::from_slice(&f.env, b"VALID-CODE");
+    let hash = sha256_bytes(&f.env, &code);
+    let now = f.env.ledger().timestamp();
+    f.client.create_transfer_offer(&unit_id, &hash, &(now + 10));
+    let before = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(
+        f.client
+            .try_redeem_transfer(&unit_id, &Bytes::from_slice(&f.env, b"WRONG"), &f.bob),
+        Err(Ok(RegistryError::InvalidTransferCode))
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+    f.env.ledger().with_mut(|li| li.timestamp = now + 11);
+    assert_eq!(
+        f.client.try_redeem_transfer(&unit_id, &code, &f.bob),
+        Err(Ok(RegistryError::TransferOfferExpired))
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+    f.client.cancel_transfer_offer(&unit_id);
+    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 0);
+}
+
+#[test]
+fn test_transfer_count_settings_require_current_brand_admin_and_emit_event() {
+    use crate::events::BatchTransferLimitUpdated;
+    use soroban_sdk::events::Event;
+
+    let f = TestFixture::setup();
+    let unit_id = activate_transfer_count_unit(&f);
+    let batch_id = f.client.get_unit(&unit_id).unwrap().batch_id;
+    assert_eq!(
+        f.client
+            .try_set_max_transfers(&f.brand, &f.hash_str("MISSING"), &Some(2)),
+        Err(Ok(RegistryError::BatchNotFound))
+    );
+    let rotated = Address::generate(&f.env);
+    f.client.rotate_brand_admin(&f.brand, &rotated);
+    let args: Vec<soroban_sdk::Val> =
+        (f.brand.clone(), batch_id.clone(), Some(2u32)).into_val(&f.env);
+    for unauthorized in [&f.alice, &f.service_center, &f.admin, &f.brand] {
+        f.env.mock_auths(&[MockAuth {
+            address: unauthorized,
+            invoke: &MockAuthInvoke {
+                contract: &f.contract_id,
+                fn_name: "set_max_transfers",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(f
+            .client
+            .try_set_max_transfers(&f.brand, &batch_id, &Some(2))
+            .is_err());
+        assert_eq!(
+            f.client
+                .get_batch(&f.brand, &batch_id)
+                .unwrap()
+                .max_transfers,
+            None
+        );
+    }
+    f.env.mock_auths(&[MockAuth {
+        address: &rotated,
+        invoke: &MockAuthInvoke {
+            contract: &f.contract_id,
+            fn_name: "set_max_transfers",
+            args,
+            sub_invokes: &[],
+        },
+    }]);
+    f.client.set_max_transfers(&f.brand, &batch_id, &Some(2));
+    assert_eq!(
+        f.env.events().all(),
+        [BatchTransferLimitUpdated {
+            brand: f.brand.clone(),
+            batch_id: batch_id.clone(),
+            max_transfers: Some(2),
+        }
+        .to_xdr(&f.env, &f.contract_id)]
+    );
+    assert_eq!(
+        f.client
+            .get_batch(&f.brand, &batch_id)
+            .unwrap()
+            .max_transfers,
+        Some(2)
+    );
+}
+
+#[test]
+fn test_transfer_count_overflow_cannot_reset_counter() {
+    let f = TestFixture::setup();
+    let unit_id = activate_transfer_count_unit(&f);
+    f.env.as_contract(&f.contract_id, || {
+        let mut unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
+        unit.transfer_count = u32::MAX;
+        crate::storage::set_unit(&f.env, &unit_id, &unit);
+    });
+    assert_eq!(
+        f.client.try_create_transfer_offer(
+            &unit_id,
+            &f.hash_str("CODE"),
+            &(f.env.ledger().timestamp() + 1000)
+        ),
+        Err(Ok(RegistryError::TransferLimitReached))
+    );
+    assert_eq!(
+        f.client.get_unit(&unit_id).unwrap().transfer_count,
+        u32::MAX
+    );
+}
+#[test]
+fn test_merged_batch_metadata_and_expiration_storage() {
+    use crate::types::BatchStatus;
+    use soroban_sdk::{Map, Symbol, TryFromVal, Val};
+
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("MERGED-BATCH");
+    let (root, _) = f.build_sample_batch(1);
+    let metadata = f.hash_str("DOCUMENT");
+    let expiry = f.env.ledger().timestamp() + 100;
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &root,
+        &12,
+        &f.hash_str("META"),
+        &1,
+        &Some(expiry),
+        &Some(metadata.clone()),
+    );
+    let batch = f.client.get_batch(&f.brand, &batch_id).unwrap();
+    assert_eq!(batch.expires_at, Some(expiry));
+    assert_eq!(
+        f.client.get_batch_metadata_cid(&f.brand, &batch_id),
+        Some(metadata.clone())
+    );
+
+    // Preserve whichever optional feature was stored by an earlier contract version.
+    for (omit_expiry, omit_metadata) in [(true, false), (false, true), (true, true)] {
+        f.env.as_contract(&f.contract_id, || {
+            let value: Val = batch.clone().into_val(&f.env);
+            let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &value).unwrap();
+            if omit_expiry {
+                fields.remove(Symbol::new(&f.env, "expires_at"));
+                fields.remove(Symbol::new(&f.env, "status"));
+            }
+            if omit_metadata {
+                fields.remove(Symbol::new(&f.env, "metadata_cid"));
+            }
+            f.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Batch(f.brand.clone(), batch_id.clone()), &fields);
+        });
+        let restored = f.client.get_batch(&f.brand, &batch_id).unwrap();
+        assert_eq!(
+            restored.expires_at,
+            if omit_expiry { None } else { Some(expiry) }
+        );
+        assert_eq!(
+            restored.metadata_cid,
+            if omit_metadata {
+                None
+            } else {
+                Some(metadata.clone())
+            }
+        );
+    }
+    f.env.as_contract(&f.contract_id, || {
+        crate::storage::set_batch(&f.env, &f.brand, &batch_id, &batch);
+    });
+    f.env.ledger().with_mut(|li| li.timestamp = expiry + 1);
+    assert_eq!(
+        f.client.get_batch(&f.brand, &batch_id).unwrap().status,
+        BatchStatus::Expired
+    );
+    assert_eq!(
+        f.client.get_batch_metadata_cid(&f.brand, &batch_id),
+        Some(metadata)
+    );
+}
+
+#[test]
+fn test_merged_legacy_brand_governance() {
+    use crate::{
+        storage::LegacyBrand,
+        types::{BrandAction, BrandAdminConfig},
+    };
+
+    let f = TestFixture::setup();
+    let legacy = LegacyBrand {
+        admin: f.brand.clone(),
+        domain: String::from_str(&f.env, "legacy.example"),
+        verified: true,
+        registered_at: f.env.ledger().timestamp(),
+    };
+    f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Brand(f.brand.clone()), &legacy);
+    });
+    let config = BrandAdminConfig {
+        admins: Vec::from_array(&f.env, [f.brand.clone(), f.alice.clone()]),
+        threshold: 2,
+    };
+    f.client.configure_brand_admins(&f.brand, &config);
+    assert_eq!(f.client.get_brand_admin_config(&f.brand), Some(config));
+    assert_eq!(
+        f.client
+            .try_register_service_center(&f.brand, &f.service_center),
+        Err(Ok(RegistryError::NotAuthorized)),
+    );
+    let proposal = f.client.propose_brand_action(
+        &f.brand,
+        &f.brand,
+        &BrandAction::RegisterServiceCenter(f.service_center.clone()),
+    );
+    assert!(!f.client.is_service_center(&f.brand, &f.service_center));
+    assert!(f.client.approve_brand_action(&f.alice, &f.brand, &proposal));
+    assert!(f.client.is_service_center(&f.brand, &f.service_center));
+}
+
+#[test]
+fn test_transfer_count_legacy_records_and_retirement() {
+    use soroban_sdk::{Map, Symbol, TryFromVal, Val};
+
+    let f = TestFixture::setup();
+    let unit_id = activate_transfer_count_unit(&f);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    f.env.as_contract(&f.contract_id, || {
+        let unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
+        let value: Val = unit.into_val(&f.env);
+        let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &value).unwrap();
+        fields.remove(Symbol::new(&f.env, "transfer_count"));
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id.clone()), &fields);
+        let batch = crate::storage::get_batch(&f.env, &f.brand, &before.batch_id).unwrap();
+        let value: Val = batch.into_val(&f.env);
+        let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &value).unwrap();
+        fields.remove(Symbol::new(&f.env, "max_transfers"));
+        f.env.storage().persistent().set(
+            &DataKey::Batch(f.brand.clone(), before.batch_id.clone()),
+            &fields,
+        );
+    });
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+    assert_eq!(
+        f.client
+            .get_batch(&f.brand, &before.batch_id)
+            .unwrap()
+            .max_transfers,
+        None
+    );
+    f.client
+        .set_max_transfers(&f.brand, &before.batch_id, &Some(1));
+    let code = Bytes::from_slice(&f.env, b"LEGACY-COUNT");
+    let hash = sha256_bytes(&f.env, &code);
+    let expires_at = f.env.ledger().timestamp() + 10_000;
+    f.client.create_transfer_offer(&unit_id, &hash, &expires_at);
+    f.client.redeem_transfer(&unit_id, &code, &f.bob);
+    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 1);
+    assert_eq!(
+        f.client
+            .try_create_transfer_offer(&unit_id, &hash, &expires_at),
+        Err(Ok(RegistryError::TransferLimitReached)),
+    );
+    f.client
+        .retire_unit(&f.bob, &unit_id, &1, &f.hash_str("RECYCLING-CERT"));
+    f.client
+        .set_max_transfers(&f.brand, &before.batch_id, &None);
+    assert_eq!(
+        f.client
+            .try_create_transfer_offer(&unit_id, &hash, &expires_at),
+        Err(Ok(RegistryError::UnitRetired)),
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 1);
+    assert!(f.client.get_unit_retirement(&unit_id).is_some());
 }

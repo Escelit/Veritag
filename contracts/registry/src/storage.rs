@@ -1,7 +1,10 @@
-use soroban_sdk::{contracttype, Address, BytesN, Env, Map, Symbol, TryFromVal, Val};
+use soroban_sdk::{
+    contracttype, Address, BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
+};
 
 use crate::types::{
-    Batch, BatchStatus, Brand, Claim, Config, TransferOffer, Unit, SECONDS_PER_MONTH,
+    Batch, BatchStatus, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, TransferOffer,
+    Unit, UnitRetirement, SECONDS_PER_MONTH,
 };
 
 /// Storage layout used before optional expiration was introduced.
@@ -17,17 +20,14 @@ pub struct LegacyBatch {
     pub recalled: bool,
 }
 
-/// Storage layout used before optional document metadata was introduced.
+/// Storage layout used before threshold governance was introduced.
 #[contracttype]
 #[derive(Clone)]
-pub struct LegacyBatch {
-    pub brand: Address,
-    pub merkle_root: BytesN<32>,
-    pub warranty_months: u32,
-    pub product_meta_hash: BytesN<32>,
-    pub unit_count: u64,
-    pub created_at: u64,
-    pub recalled: bool,
+pub struct LegacyBrand {
+    pub admin: Address,
+    pub domain: String,
+    pub verified: bool,
+    pub registered_at: u64,
 }
 
 /// Approximate Stellar ledger close interval (~5 seconds per ledger).
@@ -218,23 +218,26 @@ pub fn get_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> Option<Ba
         .storage()
         .persistent()
         .get(&DataKey::Batch(brand.clone(), batch_id.clone()))?;
-    let fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid batch storage");
-    let mut batch = if fields.len() == 7 {
-        let legacy = LegacyBatch::try_from_val(env, &value).expect("invalid batch storage");
-        Batch {
-            brand: legacy.brand,
-            merkle_root: legacy.merkle_root,
-            warranty_months: legacy.warranty_months,
-            product_meta_hash: legacy.product_meta_hash,
-            unit_count: legacy.unit_count,
-            created_at: legacy.created_at,
-            recalled: legacy.recalled,
-            expires_at: None,
-            status: BatchStatus::Active,
-        }
-    } else {
-        Batch::try_from_val(env, &value).expect("invalid batch storage")
-    };
+    // Independently merged batch features may be absent from older stored records.
+    let mut fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid batch storage");
+    let metadata_key = Symbol::new(env, "metadata_cid");
+    if !fields.contains_key(metadata_key.clone()) {
+        fields.set(metadata_key, None::<BytesN<32>>.into_val(env));
+    }
+    let expiry_key = Symbol::new(env, "expires_at");
+    if !fields.contains_key(expiry_key.clone()) {
+        fields.set(expiry_key, None::<u64>.into_val(env));
+    }
+    let status_key = Symbol::new(env, "status");
+    if !fields.contains_key(status_key.clone()) {
+        fields.set(status_key, BatchStatus::Active.into_val(env));
+    }
+    let limit_key = Symbol::new(env, "max_transfers");
+    if !fields.contains_key(limit_key.clone()) {
+        fields.set(limit_key, None::<u32>.into_val(env));
+    }
+    let normalized: Val = fields.into_val(env);
+    let mut batch = Batch::try_from_val(env, &normalized).expect("invalid batch storage");
     // Time advances without a transaction. Derive the effective status on every read.
     batch.status = if batch.recalled {
         BatchStatus::Recalled
@@ -264,9 +267,17 @@ pub fn has_unit(env: &Env, unit_id: &BytesN<32>) -> bool {
 }
 
 pub fn get_unit(env: &Env, unit_id: &BytesN<32>) -> Option<Unit> {
-    env.storage()
+    let value: Val = env
+        .storage()
         .persistent()
-        .get(&DataKey::Unit(unit_id.clone()))
+        .get(&DataKey::Unit(unit_id.clone()))?;
+    let mut fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid unit storage");
+    let count_key = Symbol::new(env, "transfer_count");
+    if !fields.contains_key(count_key.clone()) {
+        fields.set(count_key, 0u32.into_val(env));
+    }
+    let normalized: Val = fields.into_val(env);
+    Some(Unit::try_from_val(env, &normalized).expect("invalid unit storage"))
 }
 
 pub fn set_unit(env: &Env, unit_id: &BytesN<32>, unit: &Unit) {

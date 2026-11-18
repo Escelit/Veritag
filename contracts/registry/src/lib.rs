@@ -8,14 +8,15 @@ pub mod types;
 use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
 use crate::events::{
-    BatchCommitted, BatchRecalled, BrandActionExecuted, BrandActionProposed, BrandRegistered,
-    BrandVerified, ClaimFiled, ClaimResolved, DuplicateAttempt, ServiceCenterRegistered,
-    TransferCancelled, TransferOffered, UnitActivated, UnitFlagged, UnitTransferred,
+    BatchCommitted, BatchRecalled, BatchTransferLimitUpdated, BrandActionExecuted,
+    BrandActionProposed, BrandRegistered, BrandVerified, ClaimFiled, ClaimResolved,
+    DuplicateAttempt, ServiceCenterRegistered, TransferCancelled, TransferOffered, UnitActivated,
+    UnitFlagged, UnitRetired, UnitTransferred,
 };
 use crate::types::{
-    Batch, BatchStatus, Brand, Claim, ClaimOutcome, Config, RegistryError, TransferOffer, Unit,
-    UnitStatus, UnitView, VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
-    SECONDS_PER_MONTH,
+    Batch, BatchStatus, Brand, BrandAction, BrandActionProposal, BrandAdminConfig, Claim,
+    ClaimOutcome, Config, RegistryError, TransferOffer, Unit, UnitRetirement, UnitStatus, UnitView,
+    VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT, SECONDS_PER_MONTH,
 };
 
 const MAX_DOMAIN_LEN: u32 = 253;
@@ -269,7 +270,7 @@ impl VeritagRegistry {
     // -------------------------------------------------------------------------
 
     /// Commits a production batch Merkle root for a verified brand.
-    // Keep the existing Soroban ABI arguments alongside optional expiration.
+    // Preserve both optional expiration and metadata from the merged batch features.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_batch(
         env: Env,
@@ -280,6 +281,7 @@ impl VeritagRegistry {
         product_meta_hash: BytesN<32>,
         unit_count: u64,
         expires_at: Option<u64>,
+        metadata_cid: Option<BytesN<32>>,
     ) -> Result<(), RegistryError> {
         if unit_count == 0 || expires_at.is_some_and(|expiry| expiry <= env.ledger().timestamp()) {
             return Err(RegistryError::InvalidInput);
@@ -295,6 +297,7 @@ impl VeritagRegistry {
             brand: brand.clone(),
             merkle_root: merkle_root.clone(),
             warranty_months,
+            max_transfers: None,
             product_meta_hash,
             metadata_cid: metadata_cid.clone(),
             unit_count,
@@ -313,6 +316,30 @@ impl VeritagRegistry {
             warranty_months,
             unit_count,
             metadata_cid,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Sets a batch's custody transfer cap (brand admin only).
+    /// None removes the cap; Some(0) disables transfers without resetting unit counters.
+    pub fn set_max_transfers(
+        env: Env,
+        brand: Address,
+        batch_id: BytesN<32>,
+        max_transfers: Option<u32>,
+    ) -> Result<(), RegistryError> {
+        let brand_record = storage::get_brand(&env, &brand).ok_or(RegistryError::BrandNotFound)?;
+        brand_record.admin.require_auth();
+        let mut batch =
+            storage::get_batch(&env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
+        batch.max_transfers = max_transfers;
+        storage::set_batch(&env, &brand, &batch_id, &batch);
+        storage::extend_instance_ttl(&env);
+        BatchTransferLimitUpdated {
+            brand,
+            batch_id,
+            max_transfers,
         }
         .publish(&env);
         Ok(())
@@ -373,6 +400,7 @@ impl VeritagRegistry {
             batch_id: batch_id.clone(),
             owner: first_owner.clone(),
             status: UnitStatus::Active,
+            transfer_count: 0,
             activated_at: now,
             warranty_expiry,
             claims_used: 0,
@@ -484,6 +512,7 @@ impl VeritagRegistry {
         let mut unit = storage::get_unit(&env, &unit_id).ok_or(RegistryError::UnitNotFound)?;
         Self::ensure_unit_operational(&env, &unit)?;
         unit.owner.require_auth();
+        Self::ensure_transfer_limit(&env, &unit)?;
 
         let now = env.ledger().timestamp();
         if expires_at <= now {
@@ -520,6 +549,8 @@ impl VeritagRegistry {
 
         let mut unit = storage::get_unit(&env, &unit_id).ok_or(RegistryError::UnitNotFound)?;
         Self::ensure_unit_operational(&env, &unit)?;
+        // A brand may have lowered the cap since the owner created this offer.
+        Self::ensure_transfer_limit(&env, &unit)?;
 
         let offer =
             storage::get_offer(&env, &unit_id).ok_or(RegistryError::TransferOfferNotFound)?;
@@ -534,6 +565,10 @@ impl VeritagRegistry {
 
         let previous_owner = unit.owner.clone();
         unit.owner = new_owner.clone();
+        unit.transfer_count = unit
+            .transfer_count
+            .checked_add(1)
+            .ok_or(RegistryError::TransferLimitReached)?;
         unit.history_len = unit.history_len.saturating_add(1);
 
         storage::remove_offer(&env, &unit_id);
@@ -544,6 +579,7 @@ impl VeritagRegistry {
             unit_id,
             from: previous_owner,
             to: new_owner,
+            transfer_count: unit.transfer_count,
         }
         .publish(&env);
         Ok(())
@@ -721,7 +757,7 @@ impl VeritagRegistry {
             storage::get_batch(env, &brand, &batch_id).ok_or(RegistryError::BatchNotFound)?;
         batch.recalled = true;
         batch.status = BatchStatus::Recalled;
-        storage::set_batch(&env, &brand, &batch_id, &batch);
+        storage::set_batch(env, &brand, &batch_id, &batch);
 
         BatchRecalled {
             brand,
@@ -962,6 +998,19 @@ impl VeritagRegistry {
         Ok(())
     }
 
+    fn ensure_transfer_limit(env: &Env, unit: &Unit) -> Result<(), RegistryError> {
+        let batch = storage::get_batch(env, &unit.brand, &unit.batch_id)
+            .ok_or(RegistryError::BatchNotFound)?;
+        if unit.transfer_count == u32::MAX
+            || batch
+                .max_transfers
+                .is_some_and(|max| unit.transfer_count >= max)
+        {
+            return Err(RegistryError::TransferLimitReached);
+        }
+        Ok(())
+    }
+
     fn build_unit_view(env: &Env, unit_id: BytesN<32>, unit: Unit) -> UnitView {
         let batch_recalled = storage::get_batch(env, &unit.brand, &unit.batch_id)
             .map(|b| b.recalled)
@@ -983,6 +1032,7 @@ impl VeritagRegistry {
             batch_id: unit.batch_id,
             owner: unit.owner,
             status: effective_status,
+            transfer_count: unit.transfer_count,
             activated_at: unit.activated_at,
             warranty_expiry: unit.warranty_expiry,
             warranty_valid,
