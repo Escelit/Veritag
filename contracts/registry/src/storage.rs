@@ -1,6 +1,8 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env};
 
-use crate::types::{Batch, Brand, Claim, Config, TransferOffer, Unit, SECONDS_PER_MONTH};
+use crate::types::{
+    Batch, Brand, Claim, Config, TransferOffer, Unit, UnitRetirement, SECONDS_PER_MONTH,
+};
 
 /// Approximate Stellar ledger close interval (~5 seconds per ledger).
 pub const SECONDS_PER_LEDGER: u64 = 5;
@@ -28,6 +30,7 @@ pub enum DataKey {
     ServiceCenter(Address, Address),
     Batch(Address, BytesN<32>),
     Unit(BytesN<32>),
+    UnitRetirement(BytesN<32>),
     Offer(BytesN<32>),
     Claim(BytesN<32>, u32),
 }
@@ -173,6 +176,23 @@ pub fn set_unit(env: &Env, unit_id: &BytesN<32>, unit: &Unit) {
     let key = DataKey::Unit(unit_id.clone());
     env.storage().persistent().set(&key, unit);
     extend_unit_ttl_for_warranty(env, &key, unit.warranty_expiry);
+}
+
+pub fn get_unit_retirement(env: &Env, unit_id: &BytesN<32>) -> Option<UnitRetirement> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UnitRetirement(unit_id.clone()))
+}
+
+pub fn set_unit_retirement(
+    env: &Env,
+    unit_id: &BytesN<32>,
+    retirement: &UnitRetirement,
+    warranty_expiry: u64,
+) {
+    let key = DataKey::UnitRetirement(unit_id.clone());
+    env.storage().persistent().set(&key, retirement);
+    extend_unit_ttl_for_warranty(env, &key, warranty_expiry);
 }
 
 // --- Transfer Offer (Temporary Storage) ---

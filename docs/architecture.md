@@ -23,6 +23,7 @@ flowchart TD
 1. **`contracts/registry` (`VeritagRegistry`):**
    - Single multi-tenant authenticity and warranty registry serving all verified brands.
    - Uses **Instance** storage for `Config`, **Persistent** storage for `Brand`, `ServiceCenter`, `Batch`, `Unit`, and `Claim` (with TTLs automatically extended to cover the remaining warranty + 90-day buffer), and **Temporary** storage for expiring `TransferOffer` codes.
+   - `retire_unit(caller, unit_id, reason_code, cert_hash)` lets the current owner or current brand admin permanently retire a product, including flagged or recalled products. A persistent `UnitRetirement` record stores the retiring address, reason, certificate digest, and timestamp; `get_unit_retirement` exposes it and `UnitRetired` emits the certificate details. Retirement clears transfer offers and prevents activation, transfers, new claims, pending claim resolution, and flagging. Existing replacement-based retirement remains supported.
 2. **`contracts/passkey-account` (`PasskeyAccountContract`):**
    - Implements Soroban `CustomAccountInterface` (`__check_auth`) verifying WebAuthn `authenticatorData` (User Present bit), base64url challenge binding in `clientDataJSON`, and `secp256r1_verify` (P-256) hardware signatures, plus optional `Recovery` signer fallback and passkey rotation (`add_passkey`, `remove_passkey`).
 3. **`contracts/account-factory` (`AccountFactoryContract`):**

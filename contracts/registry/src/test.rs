@@ -634,3 +634,237 @@ fn test_ttl_extension_and_strict_authorization() {
         .try_create_transfer_offer(&unit_id, &code_hash, &expires_at)
         .is_ok());
 }
+
+#[test]
+fn test_retire_unit() {
+    use crate::events::UnitRetired;
+    use soroban_sdk::events::Event;
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("RECYCLE");
+    let meta = f.hash_str("META");
+    let (root, units) = f.build_sample_batch(1);
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &meta, &1);
+    let unit_id = f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    let claim_id = f.client.file_claim(&unit_id, &f.service_center);
+    let code = Bytes::from_slice(&f.env, b"PENDING-TRANSFER");
+    let code_hash = sha256_bytes(&f.env, &code);
+    let expires = f.env.ledger().timestamp() + 1000;
+    f.client
+        .create_transfer_offer(&unit_id, &code_hash, &expires);
+    let history_len = f.client.get_unit(&unit_id).unwrap().history_len;
+    let cert = f.hash_str("RECYCLING-CERTIFICATE");
+    assert_eq!(
+        f.client.try_retire_unit(&f.bob, &unit_id, &7, &cert),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    assert_eq!(
+        f.client.get_unit(&unit_id).unwrap().status,
+        UnitStatus::Active
+    );
+    assert!(f.client.get_unit_retirement(&unit_id).is_none());
+    f.client.retire_unit(&f.alice, &unit_id, &7, &cert);
+    let event = UnitRetired {
+        unit_id: unit_id.clone(),
+        caller: f.alice.clone(),
+        reason_code: 7,
+        cert_hash: cert.clone(),
+    };
+    assert_eq!(
+        f.env.events().all(),
+        Vec::from_array(
+            &f.env,
+            [(
+                f.contract_id.clone(),
+                event.topics(&f.env),
+                event.data(&f.env)
+            )]
+        )
+    );
+    let retirement = f.client.get_unit_retirement(&unit_id).unwrap();
+    assert_eq!(retirement.caller, f.alice);
+    assert_eq!(retirement.reason_code, 7);
+    assert_eq!(retirement.cert_hash, cert);
+    assert_eq!(retirement.retired_at, f.env.ledger().timestamp());
+    let view = f.client.get_unit(&unit_id).unwrap();
+    assert_eq!(view.status, UnitStatus::Retired);
+    assert_eq!(view.history_len, history_len + 1);
+    assert!(!view.warranty_valid);
+    assert!(!f.client.is_warranty_valid(&unit_id));
+    assert!(f.client.get_transfer_offer(&unit_id).is_none());
+    assert_eq!(
+        f.client
+            .try_create_transfer_offer(&unit_id, &code_hash, &expires),
+        Err(Ok(RegistryError::UnitRetired))
+    );
+    assert_eq!(
+        f.client.try_redeem_transfer(&unit_id, &code, &f.bob),
+        Err(Ok(RegistryError::UnitRetired))
+    );
+    assert_eq!(
+        f.client.try_file_claim(&unit_id, &f.service_center),
+        Err(Ok(RegistryError::UnitRetired))
+    );
+    assert_eq!(
+        f.client.try_activate(
+            &f.brand,
+            &batch_id,
+            &units[0].0,
+            &units[0].3,
+            &units[0].1,
+            &f.bob
+        ),
+        Err(Ok(RegistryError::UnitRetired))
+    );
+    assert_eq!(
+        f.client
+            .try_resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Repaired, &meta),
+        Err(Ok(RegistryError::UnitRetired))
+    );
+    assert_eq!(
+        f.client.try_flag_unit(&unit_id, &meta),
+        Err(Ok(RegistryError::UnitRetired))
+    );
+    assert_eq!(
+        f.client.try_retire_unit(&f.alice, &unit_id, &8, &meta),
+        Err(Ok(RegistryError::UnitRetired))
+    );
+    assert_eq!(f.client.get_unit_retirement(&unit_id), Some(retirement));
+    let verify = f
+        .client
+        .verify_serial(&f.brand, &batch_id, &units[0].0, &units[0].3, &units[0].2);
+    assert_eq!(verify.status, VerifyStatus::Retired);
+    assert!(!verify.warranty_valid);
+    f.client.recall_batch(&f.brand, &batch_id, &meta);
+    assert_eq!(
+        f.client.try_activate(
+            &f.brand,
+            &batch_id,
+            &units[0].0,
+            &units[0].3,
+            &units[0].1,
+            &f.bob
+        ),
+        Err(Ok(RegistryError::UnitRetired))
+    );
+    assert_eq!(
+        f.client.try_file_claim(&unit_id, &f.service_center),
+        Err(Ok(RegistryError::UnitRetired))
+    );
+    assert_eq!(
+        f.client.get_unit(&unit_id).unwrap().status,
+        UnitStatus::Retired
+    );
+}
+
+#[test]
+fn test_retire_unit_current_owner_and_rotated_brand_admin() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("RETIRE-AUTH");
+    let cert = f.hash_str("CERT");
+    let (root, units) = f.build_sample_batch(2);
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &cert, &2);
+    let first = f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    let second = f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[1].0,
+        &units[1].3,
+        &units[1].1,
+        &f.alice,
+    );
+    let code = Bytes::from_slice(&f.env, b"TRANSFER");
+    f.client.create_transfer_offer(
+        &first,
+        &sha256_bytes(&f.env, &code),
+        &(f.env.ledger().timestamp() + 100),
+    );
+    f.client.redeem_transfer(&first, &code, &f.bob);
+    assert_eq!(
+        f.client.try_retire_unit(&f.alice, &first, &1, &cert),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    f.client.retire_unit(&f.bob, &first, &1, &cert);
+    assert_eq!(f.client.get_unit_retirement(&first).unwrap().caller, f.bob);
+    f.client.flag_unit(&second, &cert);
+    let new_admin = Address::generate(&f.env);
+    f.client.rotate_brand_admin(&f.brand, &new_admin);
+    assert_eq!(
+        f.client.try_retire_unit(&f.brand, &second, &2, &cert),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    f.client.recall_batch(&f.brand, &batch_id, &cert);
+    f.client.retire_unit(&new_admin, &second, &2, &cert);
+    assert_eq!(
+        f.client.get_unit(&second).unwrap().status,
+        UnitStatus::Retired
+    );
+    assert_eq!(
+        f.client.get_unit_retirement(&second).unwrap().caller,
+        new_admin
+    );
+}
+
+#[test]
+fn test_retire_unit_requires_signature_and_existing_unit() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("RETIRE-SIGNATURE");
+    let cert = f.hash_str("CERT");
+    assert_eq!(
+        f.client
+            .try_retire_unit(&f.alice, &f.hash_str("MISSING"), &0, &cert),
+        Err(Ok(RegistryError::UnitNotFound))
+    );
+    let (root, units) = f.build_sample_batch(1);
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &cert, &1);
+    let unit_id = f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    f.env.mock_auths(&[]);
+    assert!(f
+        .client
+        .try_retire_unit(&f.alice, &unit_id, &0, &cert)
+        .is_err());
+    assert_eq!(
+        f.client.get_unit(&unit_id).unwrap().status,
+        UnitStatus::Active
+    );
+    f.env.mock_auths(&[MockAuth {
+        address: &f.alice,
+        invoke: &MockAuthInvoke {
+            contract: &f.contract_id,
+            fn_name: "retire_unit",
+            args: (f.alice.clone(), unit_id.clone(), 0u32, cert.clone()).into_val(&f.env),
+            sub_invokes: &[],
+        },
+    }]);
+    f.client.retire_unit(&f.alice, &unit_id, &0, &cert);
+    assert_eq!(
+        f.client.get_unit(&unit_id).unwrap().status,
+        UnitStatus::Retired
+    );
+}

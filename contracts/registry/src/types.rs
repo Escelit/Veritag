@@ -75,6 +75,15 @@ pub enum UnitStatus {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnitRetirement {
+    pub caller: Address,
+    pub reason_code: u32,
+    pub cert_hash: BytesN<32>,
+    pub retired_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Unit {
     pub brand: Address,
     pub batch_id: BytesN<32>,

@@ -171,6 +171,12 @@ export interface TransferOffer {
 }
 
 
+export interface UnitRetirement {
+  caller: string;
+  cert_hash: Buffer;
+  reason_code: u32;
+  retired_at: u64;
+}
 
 
 
@@ -183,7 +189,10 @@ export interface TransferOffer {
 
 
 
-export type DataKey = {tag: "Config", values: void} | {tag: "Brand", values: readonly [string]} | {tag: "ServiceCenter", values: readonly [string, string]} | {tag: "Batch", values: readonly [string, Buffer]} | {tag: "Unit", values: readonly [Buffer]} | {tag: "Offer", values: readonly [Buffer]} | {tag: "Claim", values: readonly [Buffer, u32]};
+
+
+
+export type DataKey = {tag: "Config", values: void} | {tag: "Brand", values: readonly [string]} | {tag: "ServiceCenter", values: readonly [string, string]} | {tag: "Batch", values: readonly [string, Buffer]} | {tag: "Unit", values: readonly [Buffer]} | {tag: "UnitRetirement", values: readonly [Buffer]} | {tag: "Offer", values: readonly [Buffer]} | {tag: "Claim", values: readonly [Buffer, u32]};
 
 export interface Client {
   /**
@@ -234,6 +243,12 @@ export interface Client {
    * Construct and simulate a get_config transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    */
   get_config: (options?: MethodOptions) => Promise<AssembledTransaction<Option<Config>>>
+
+  /**
+   * Construct and simulate a retire_unit transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Permanently retires a unit and records its recycling certificate (owner or brand admin).
+   */
+  retire_unit: ({caller, unit_id, reason_code, cert_hash}: {caller: string, unit_id: Buffer, reason_code: u32, cert_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
    * Construct and simulate a commit_batch transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -322,6 +337,11 @@ export interface Client {
   rotate_brand_admin: ({brand, new_admin}: {brand: string, new_admin: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a get_unit_retirement transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  get_unit_retirement: ({unit_id}: {unit_id: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Option<UnitRetirement>>>
+
+  /**
    * Construct and simulate a cancel_transfer_offer transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Cancels an active resale transfer offer (current owner only).
    */
@@ -386,6 +406,7 @@ export class Client extends ContractClient {
         "AAAAAAAAAAAAAAAJZ2V0X2NsYWltAAAAAAAAAgAAAAAAAAAHdW5pdF9pZAAAAAPuAAAAIAAAAAAAAAAIY2xhaW1faWQAAAAEAAAAAQAAA+gAAAfQAAAABUNsYWltAAAA",
         "AAAAAAAAAE5GaWxlcyBhIHdhcnJhbnR5IGNsYWltIHdpdGggYW4gYXV0aG9yaXplZCBzZXJ2aWNlIGNlbnRlciBmb3IgdGhlIHVuaXQncyBicmFuZC4AAAAAAApmaWxlX2NsYWltAAAAAAACAAAAAAAAAAd1bml0X2lkAAAAA+4AAAAgAAAAAAAAAA5zZXJ2aWNlX2NlbnRlcgAAAAAAEwAAAAEAAAPpAAAABAAAB9AAAAANUmVnaXN0cnlFcnJvcgAAAA==",
         "AAAAAAAAAAAAAAAKZ2V0X2NvbmZpZwAAAAAAAAAAAAEAAAPoAAAH0AAAAAZDb25maWcAAA==",
+        "AAAAAAAAAFhQZXJtYW5lbnRseSByZXRpcmVzIGEgdW5pdCBhbmQgcmVjb3JkcyBpdHMgcmVjeWNsaW5nIGNlcnRpZmljYXRlIChvd25lciBvciBicmFuZCBhZG1pbikuAAAAC3JldGlyZV91bml0AAAAAAQAAAAAAAAABmNhbGxlcgAAAAAAEwAAAAAAAAAHdW5pdF9pZAAAAAPuAAAAIAAAAAAAAAALcmVhc29uX2NvZGUAAAAABAAAAAAAAAAJY2VydF9oYXNoAAAAAAAD7gAAACAAAAABAAAD6QAAAAIAAAfQAAAADVJlZ2lzdHJ5RXJyb3IAAAA=",
         "AAAAAAAAADxDb21taXRzIGEgcHJvZHVjdGlvbiBiYXRjaCBNZXJrbGUgcm9vdCBmb3IgYSB2ZXJpZmllZCBicmFuZC4AAAAMY29tbWl0X2JhdGNoAAAABgAAAAAAAAAFYnJhbmQAAAAAAAATAAAAAAAAAAhiYXRjaF9pZAAAA+4AAAAgAAAAAAAAAAttZXJrbGVfcm9vdAAAAAPuAAAAIAAAAAAAAAAPd2FycmFudHlfbW9udGhzAAAAAAQAAAAAAAAAEXByb2R1Y3RfbWV0YV9oYXNoAAAAAAAD7gAAACAAAAAAAAAACnVuaXRfY291bnQAAAAAAAYAAAABAAAD6QAAAAIAAAfQAAAADVJlZ2lzdHJ5RXJyb3IAAAA=",
         "AAAAAAAAAEJSZWNhbGxzIGFuIGVudGlyZSBwcm9kdWN0aW9uIGJhdGNoIGltbWVkaWF0ZWx5IChicmFuZCBhZG1pbiBvbmx5KS4AAAAAAAxyZWNhbGxfYmF0Y2gAAAADAAAAAAAAAAVicmFuZAAAAAAAABMAAAAAAAAACGJhdGNoX2lkAAAD7gAAACAAAAAAAAAAC3JlYXNvbl9oYXNoAAAAA+4AAAAgAAAAAQAAA+kAAAACAAAH0AAAAA1SZWdpc3RyeUVycm9yAAAA",
         "AAAAAAAAAEVSb3RhdGVzIHRoZSByZWdpc3RyeSBhZG1pbiBhY2NvdW50IChyZWdpc3RyeSBhZG1pbiArIG5ldyBhZG1pbiBhdXRoKS4AAAAAAAAMcm90YXRlX2FkbWluAAAAAQAAAAAAAAAJbmV3X2FkbWluAAAAAAAAEwAAAAEAAAPpAAAAAgAAB9AAAAANUmVnaXN0cnlFcnJvcgAAAA==",
@@ -401,6 +422,7 @@ export class Client extends ContractClient {
         "AAAAAAAAAAAAAAARaXNfd2FycmFudHlfdmFsaWQAAAAAAAABAAAAAAAAAAd1bml0X2lkAAAAA+4AAAAgAAAAAQAAAAE=",
         "AAAAAAAAAAAAAAASZ2V0X3RyYW5zZmVyX29mZmVyAAAAAAABAAAAAAAAAAd1bml0X2lkAAAAA+4AAAAgAAAAAQAAA+gAAAfQAAAADVRyYW5zZmVyT2ZmZXIAAAA=",
         "AAAAAAAAAF5Sb3RhdGVzIHRoZSBzaWduaW5nIGFkbWluIGtleSBmb3IgYW4gZXhpc3RpbmcgYnJhbmQgd2hpbGUga2VlcGluZyBpdHMgY2Fub25pY2FsIGJyYW5kIGFkZHJlc3MuAAAAAAAScm90YXRlX2JyYW5kX2FkbWluAAAAAAACAAAAAAAAAAVicmFuZAAAAAAAABMAAAAAAAAACW5ld19hZG1pbgAAAAAAABMAAAABAAAD6QAAAAIAAAfQAAAADVJlZ2lzdHJ5RXJyb3IAAAA=",
+        "AAAAAAAAAAAAAAATZ2V0X3VuaXRfcmV0aXJlbWVudAAAAAABAAAAAAAAAAd1bml0X2lkAAAAA+4AAAAgAAAAAQAAA+gAAAfQAAAADlVuaXRSZXRpcmVtZW50AAA=",
         "AAAAAAAAAD1DYW5jZWxzIGFuIGFjdGl2ZSByZXNhbGUgdHJhbnNmZXIgb2ZmZXIgKGN1cnJlbnQgb3duZXIgb25seSkuAAAAAAAAFWNhbmNlbF90cmFuc2Zlcl9vZmZlcgAAAAAAAAEAAAAAAAAAB3VuaXRfaWQAAAAD7gAAACAAAAABAAAD6QAAAAIAAAfQAAAADVJlZ2lzdHJ5RXJyb3IAAAA=",
         "AAAAAAAAAExDcmVhdGVzIGEgb25lLXRpbWUgcmVzYWxlIHRyYW5zZmVyIG9mZmVyIGF1dGhlbnRpY2F0ZWQgYnkgdGhlIGN1cnJlbnQgb3duZXIuAAAAFWNyZWF0ZV90cmFuc2Zlcl9vZmZlcgAAAAAAAAMAAAAAAAAAB3VuaXRfaWQAAAAD7gAAACAAAAAAAAAACWNvZGVfaGFzaAAAAAAAA+4AAAAgAAAAAAAAAApleHBpcmVzX2F0AAAAAAAGAAAAAQAAA+kAAAACAAAH0AAAAA1SZWdpc3RyeUVycm9yAAAA",
         "AAAAAAAAADVSZXZva2VzIGEgc2VydmljZSBjZW50ZXIncyBhdXRob3JpemF0aW9uIGZvciBhIGJyYW5kLgAAAAAAABVyZXZva2Vfc2VydmljZV9jZW50ZXIAAAAAAAACAAAAAAAAAAVicmFuZAAAAAAAABMAAAAAAAAADnNlcnZpY2VfY2VudGVyAAAAAAATAAAAAQAAA+kAAAACAAAH0AAAAA1SZWdpc3RyeUVycm9yAAAA",
@@ -419,8 +441,10 @@ export class Client extends ContractClient {
         "AAAAAwAAAAAAAAAAAAAADFZlcmlmeVN0YXR1cwAAAAYAAAAAAAAAB1Vua25vd24AAAAAAAAAAAAAAAARQXV0aGVudGljSW5hY3RpdmUAAAAAAAABAAAAAAAAAA9BdXRoZW50aWNBY3RpdmUAAAAAAgAAAAAAAAAHRmxhZ2dlZAAAAAADAAAAAAAAAAhSZWNhbGxlZAAAAAQAAAAAAAAAB1JldGlyZWQAAAAABQ==",
         "AAAABAAAAAAAAAAAAAAADVJlZ2lzdHJ5RXJyb3IAAAAAAAAXAAAAAAAAABJBbHJlYWR5SW5pdGlhbGl6ZWQAAAAAAAEAAAAAAAAADk5vdEluaXRpYWxpemVkAAAAAAACAAAAAAAAAA1Ob3RBdXRob3JpemVkAAAAAAAAAwAAAAAAAAASQnJhbmRBbHJlYWR5RXhpc3RzAAAAAAAEAAAAAAAAAA1CcmFuZE5vdEZvdW5kAAAAAAAABQAAAAAAAAAQQnJhbmROb3RWZXJpZmllZAAAAAYAAAAAAAAAC0JhdGNoRXhpc3RzAAAAAAcAAAAAAAAADUJhdGNoTm90Rm91bmQAAAAAAAAIAAAAAAAAAAxJbnZhbGlkUHJvb2YAAAAJAAAAAAAAABRVbml0QWxyZWFkeUFjdGl2YXRlZAAAAAoAAAAAAAAADFVuaXROb3RGb3VuZAAAAAsAAAAAAAAAD1dhcnJhbnR5RXhwaXJlZAAAAAAMAAAAAAAAABFDbGFpbUxpbWl0UmVhY2hlZAAAAAAAAA0AAAAAAAAAFVRyYW5zZmVyT2ZmZXJOb3RGb3VuZAAAAAAAAA4AAAAAAAAAFFRyYW5zZmVyT2ZmZXJFeHBpcmVkAAAADwAAAAAAAAATSW52YWxpZFRyYW5zZmVyQ29kZQAAAAAQAAAAAAAAAAtVbml0RmxhZ2dlZAAAAAARAAAAAAAAAA1CYXRjaFJlY2FsbGVkAAAAAAAAEgAAAAAAAAAaU2VydmljZUNlbnRlck5vdEF1dGhvcml6ZWQAAAAAABMAAAAAAAAADUNsYWltTm90Rm91bmQAAAAAAAAUAAAAAAAAABRDbGFpbUFscmVhZHlSZXNvbHZlZAAAABUAAAAAAAAADEludmFsaWRJbnB1dAAAABYAAAAAAAAAC1VuaXRSZXRpcmVkAAAAABc=",
         "AAAAAQAAAAAAAAAAAAAADVRyYW5zZmVyT2ZmZXIAAAAAAAADAAAAAAAAAAljb2RlX2hhc2gAAAAAAAPuAAAAIAAAAAAAAAAKY3JlYXRlZF9hdAAAAAAABgAAAAAAAAAKZXhwaXJlc19hdAAAAAAABg==",
+        "AAAAAQAAAAAAAAAAAAAADlVuaXRSZXRpcmVtZW50AAAAAAAEAAAAAAAAAAZjYWxsZXIAAAAAABMAAAAAAAAACWNlcnRfaGFzaAAAAAAAA+4AAAAgAAAAAAAAAAtyZWFzb25fY29kZQAAAAAEAAAAAAAAAApyZXRpcmVkX2F0AAAAAAAG",
         "AAAABQAAAAAAAAAAAAAACkNsYWltRmlsZWQAAAAAAAEAAAALY2xhaW1fZmlsZWQAAAAAAwAAAAAAAAAHdW5pdF9pZAAAAAPuAAAAIAAAAAEAAAAAAAAACGNsYWltX2lkAAAABAAAAAAAAAAAAAAADnNlcnZpY2VfY2VudGVyAAAAAAATAAAAAAAAAAI=",
         "AAAABQAAAAAAAAAAAAAAC1VuaXRGbGFnZ2VkAAAAAAEAAAAMdW5pdF9mbGFnZ2VkAAAAAgAAAAAAAAAHdW5pdF9pZAAAAAPuAAAAIAAAAAEAAAAAAAAAC3JlYXNvbl9oYXNoAAAAA+4AAAAgAAAAAAAAAAI=",
+        "AAAABQAAAAAAAAAAAAAAC1VuaXRSZXRpcmVkAAAAAAEAAAAMdW5pdF9yZXRpcmVkAAAABAAAAAAAAAAHdW5pdF9pZAAAAAPuAAAAIAAAAAEAAAAAAAAABmNhbGxlcgAAAAAAEwAAAAAAAAAAAAAAC3JlYXNvbl9jb2RlAAAAAAQAAAAAAAAAAAAAAAljZXJ0X2hhc2gAAAAAAAPuAAAAIAAAAAAAAAAC",
         "AAAABQAAAAAAAAAAAAAADUJhdGNoUmVjYWxsZWQAAAAAAAABAAAADmJhdGNoX3JlY2FsbGVkAAAAAAADAAAAAAAAAAVicmFuZAAAAAAAABMAAAABAAAAAAAAAAhiYXRjaF9pZAAAA+4AAAAgAAAAAQAAAAAAAAALcmVhc29uX2hhc2gAAAAD7gAAACAAAAAAAAAAAg==",
         "AAAABQAAAAAAAAAAAAAADUJyYW5kVmVyaWZpZWQAAAAAAAABAAAADmJyYW5kX3ZlcmlmaWVkAAAAAAABAAAAAAAAAAVicmFuZAAAAAAAABMAAAABAAAAAg==",
         "AAAABQAAAAAAAAAAAAAADUNsYWltUmVzb2x2ZWQAAAAAAAABAAAADmNsYWltX3Jlc29sdmVkAAAAAAAEAAAAAAAAAAd1bml0X2lkAAAAA+4AAAAgAAAAAQAAAAAAAAAIY2xhaW1faWQAAAAEAAAAAAAAAAAAAAAHb3V0Y29tZQAAAAfQAAAADENsYWltT3V0Y29tZQAAAAAAAAAAAAAAC3JlcG9ydF9oYXNoAAAAA+4AAAAgAAAAAAAAAAI=",
@@ -432,7 +456,7 @@ export class Client extends ContractClient {
         "AAAABQAAAAAAAAAAAAAAEER1cGxpY2F0ZUF0dGVtcHQAAAABAAAAEWR1cGxpY2F0ZV9hdHRlbXB0AAAAAAAAAgAAAAAAAAAHdW5pdF9pZAAAAAPuAAAAIAAAAAEAAAAAAAAABmNhbGxlcgAAAAAAEwAAAAAAAAAC",
         "AAAABQAAAAAAAAAAAAAAEVRyYW5zZmVyQ2FuY2VsbGVkAAAAAAAAAQAAABJ0cmFuc2Zlcl9jYW5jZWxsZWQAAAAAAAEAAAAAAAAAB3VuaXRfaWQAAAAD7gAAACAAAAABAAAAAg==",
         "AAAABQAAAAAAAAAAAAAAF1NlcnZpY2VDZW50ZXJSZWdpc3RlcmVkAAAAAAEAAAAZc2VydmljZV9jZW50ZXJfcmVnaXN0ZXJlZAAAAAAAAAMAAAAAAAAABWJyYW5kAAAAAAAAEwAAAAEAAAAAAAAADnNlcnZpY2VfY2VudGVyAAAAAAATAAAAAQAAAAAAAAAKYXV0aG9yaXplZAAAAAAAAQAAAAAAAAAC",
-        "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAABwAAAAAAAAAAAAAABkNvbmZpZwAAAAAAAQAAAAAAAAAFQnJhbmQAAAAAAAABAAAAEwAAAAEAAAAAAAAADVNlcnZpY2VDZW50ZXIAAAAAAAACAAAAEwAAABMAAAABAAAAAAAAAAVCYXRjaAAAAAAAAAIAAAATAAAD7gAAACAAAAABAAAAAAAAAARVbml0AAAAAQAAA+4AAAAgAAAAAQAAAAAAAAAFT2ZmZXIAAAAAAAABAAAD7gAAACAAAAABAAAAAAAAAAVDbGFpbQAAAAAAAAIAAAPuAAAAIAAAAAQ=" ]),
+        "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAACAAAAAAAAAAAAAAABkNvbmZpZwAAAAAAAQAAAAAAAAAFQnJhbmQAAAAAAAABAAAAEwAAAAEAAAAAAAAADVNlcnZpY2VDZW50ZXIAAAAAAAACAAAAEwAAABMAAAABAAAAAAAAAAVCYXRjaAAAAAAAAAIAAAATAAAD7gAAACAAAAABAAAAAAAAAARVbml0AAAAAQAAA+4AAAAgAAAAAQAAAAAAAAAOVW5pdFJldGlyZW1lbnQAAAAAAAEAAAPuAAAAIAAAAAEAAAAAAAAABU9mZmVyAAAAAAAAAQAAA+4AAAAgAAAAAQAAAAAAAAAFQ2xhaW0AAAAAAAACAAAD7gAAACAAAAAE" ]),
       options
     )
   }
@@ -446,6 +470,7 @@ export class Client extends ContractClient {
         get_claim: this.txFromJSON<Option<Claim>>,
         file_claim: this.txFromJSON<Result<u32>>,
         get_config: this.txFromJSON<Option<Config>>,
+        retire_unit: this.txFromJSON<Result<void>>,
         commit_batch: this.txFromJSON<Result<void>>,
         recall_batch: this.txFromJSON<Result<void>>,
         rotate_admin: this.txFromJSON<Result<void>>,
@@ -461,6 +486,7 @@ export class Client extends ContractClient {
         is_warranty_valid: this.txFromJSON<boolean>,
         get_transfer_offer: this.txFromJSON<Option<TransferOffer>>,
         rotate_brand_admin: this.txFromJSON<Result<void>>,
+        get_unit_retirement: this.txFromJSON<Option<UnitRetirement>>,
         cancel_transfer_offer: this.txFromJSON<Result<void>>,
         create_transfer_offer: this.txFromJSON<Result<void>>,
         revoke_service_center: this.txFromJSON<Result<void>>,
