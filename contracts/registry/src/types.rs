@@ -38,7 +38,8 @@ pub enum RegistryError {
     InvalidInput = 22,
     UnitRetired = 23,
     BatchExpired = 24,
-    WarrantyLimitReached = 25,
+    BatchFrozen = 25,
+    WarrantyLimitReached = 26,
 }
 
 #[contracttype]

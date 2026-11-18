@@ -8,10 +8,10 @@ pub mod types;
 use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
 use crate::events::{
-    BatchCommitted, BatchRecalled, BrandActionExecuted, BrandActionProposed, BrandRegistered,
-    BrandVerified, ClaimFiled, ClaimResolved, DuplicateAttempt, ServiceCenterRegistered,
-    TransferCancelled, TransferOffered, UnitActivated, UnitFlagged, UnitRetired, UnitTransferred,
-    WarrantyExtended,
+    BatchCommitted, BatchFrozen, BatchRecalled, BatchUnfrozen, BrandActionExecuted,
+    BrandActionProposed, BrandRegistered, BrandVerified, ClaimFiled, ClaimResolved,
+    DuplicateAttempt, ServiceCenterRegistered, TransferCancelled, TransferOffered, UnitActivated,
+    UnitFlagged, UnitRetired, UnitTransferred, WarrantyExtended,
 };
 use crate::types::{
     Batch, BatchStatus, Brand, BrandAction, BrandActionProposal, BrandAdminConfig, Claim,
